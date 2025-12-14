@@ -77,6 +77,19 @@ class ModelPool:
                 print(f"Loaded model: {json.dumps(model_info, indent=4)}")
                 loaded = True
         if not loaded:
+            for config in MODEL_CONFIGS:
+                if config.get("allow_any_hash"):
+                    model = self.load_model_file(config, path, vram_config, vram_limit=vram_limit)
+                    if clear_parameters: self.clear_parameters(model)
+                    self.model.append(model)
+                    model_name = config["model_name"]
+                    self.model_name.append(model_name)
+                    self.model_path.append(path)
+                    model_info = {"model_name": model_name, "model_class": config["model_class"], "extra_kwargs": config.get("extra_kwargs")}
+                    print(f"Loaded model with relaxed hash check: {json.dumps(model_info, indent=4)}")
+                    loaded = True
+                    break
+        if not loaded:
             raise ValueError(f"Cannot detect the model type. File: {path}. Model hash: {model_hash}")
     
     def fetch_model(self, model_name, index=None):

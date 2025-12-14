@@ -293,6 +293,13 @@ wan_series = [
         "model_class": "diffsynth.models.wav2vec.WanS2VAudioEncoder",
         "state_dict_converter": "diffsynth.utils.state_dict_converters.wans2v_audio_encoder.WanS2VAudioEncoderStateDictConverter",
     },
+    {
+        "model_hash": "wan_mllm_encoder",
+        "model_name": "wan_mllm_encoder",
+        "model_class": "diffsynth.models.wan_video_mllm_encoder.WanMLLMEncoder",
+        "extra_kwargs": {"torch_dtype": "bfloat16"},
+        "allow_any_hash": True,
+    },
 ]
 
 flux_series = [

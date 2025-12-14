@@ -8,9 +8,9 @@ version = "2.0.0"
 description = "Enjoy the magic of Diffusion models!"
 authors = [{name = "ModelScope Team"}]
 license = {text = "Apache-2.0"}
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
-    "torch>=2.0.0",
+    "torch>=2.7.0,<2.8.0",
     "torchvision",
     "transformers",
     "imageio",
@@ -25,6 +25,7 @@ dependencies = [
     "accelerate",
     "peft",
     "datasets",
+    "flash-attn>=2.8.3",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -33,6 +34,10 @@ classifiers = [
 ]
 
 [tool.setuptools.packages.find]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
 
 [tool.setuptools]
 include-package-data = true

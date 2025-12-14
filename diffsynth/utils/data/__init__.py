@@ -215,3 +215,10 @@ def merge_video_audio(video_path: str, audio_path: str):
 def save_video_with_audio(frames, save_path, audio_path, fps=16, quality=9, ffmpeg_params=None):
     save_video(frames, save_path, fps, quality, ffmpeg_params)
     merge_video_audio(save_path, audio_path)
+from .mllm_preprocessing import (
+    MLLM_SYSTEM_PROMPT,
+    get_mllm_frame_indices,
+    normalize_pil_frames,
+    sample_mllm_frames,
+    video_to_pil_frames,
+)

@@ -1,4 +1,4 @@
-import torch, types
+import torch, types, math
 import numpy as np
 from PIL import Image
 from einops import repeat
@@ -26,6 +26,9 @@ from ..models.wan_video_animate_adapter import WanAnimateAdapter
 from ..models.wan_video_mot import MotWanModel
 from ..models.wav2vec import WanS2VAudioEncoder
 from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
+from ..models.wan_video_mllm_encoder import WanMLLMEncoder
+from ..models.wan_video_mllm_mask import compute_mllm_cross_attention_mask
+from ..utils.data import sample_mllm_frames
 
 
 class WanVideoPipeline(BasePipeline):
@@ -49,12 +52,14 @@ class WanVideoPipeline(BasePipeline):
         self.vap: MotWanModel = None
         self.animate_adapter: WanAnimateAdapter = None
         self.audio_encoder: WanS2VAudioEncoder = None
+        self.mllm_encoder: WanMLLMEncoder = None
         self.in_iteration_models = ("dit", "motion_controller", "vace", "animate_adapter", "vap")
         self.in_iteration_models_2 = ("dit2", "motion_controller", "vace2", "animate_adapter", "vap")
         self.units = [
             WanVideoUnit_ShapeChecker(),
             WanVideoUnit_NoiseInitializer(),
             WanVideoUnit_PromptEmbedder(),
+            WanVideoUnit_MLLMEmbedder(),
             WanVideoUnit_S2V(),
             WanVideoUnit_InputVideoEmbedder(),
             WanVideoUnit_ImageEmbedderVAE(),
@@ -147,6 +152,7 @@ class WanVideoPipeline(BasePipeline):
         pipe.vap = model_pool.fetch_model("wan_video_vap")
         pipe.audio_encoder = model_pool.fetch_model("wans2v_audio_encoder")
         pipe.animate_adapter = model_pool.fetch_model("wan_video_animate_adapter")
+        pipe.mllm_encoder = model_pool.fetch_model("wan_mllm_encoder")
 
         # Size division factor
         if pipe.vae is not None:
@@ -217,6 +223,8 @@ class WanVideoPipeline(BasePipeline):
         height: Optional[int] = 480,
         width: Optional[int] = 832,
         num_frames=81,
+        use_mllm_condition: Optional[bool] = False,
+        use_flex_attention: Optional[bool] = False,
         # Classifier-free guidance
         cfg_scale: Optional[float] = 5.0,
         cfg_merge: Optional[bool] = False,
@@ -265,6 +273,8 @@ class WanVideoPipeline(BasePipeline):
             "vace_video": vace_video, "vace_video_mask": vace_video_mask, "vace_reference_image": vace_reference_image, "vace_scale": vace_scale,
             "seed": seed, "rand_device": rand_device,
             "height": height, "width": width, "num_frames": num_frames,
+            "use_mllm_condition": use_mllm_condition,
+            "use_flex_attention": use_flex_attention,
             "cfg_scale": cfg_scale, "cfg_merge": cfg_merge,
             "sigma_shift": sigma_shift,
             "motion_bucket_id": motion_bucket_id,
@@ -412,6 +422,45 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
         pipe.load_models_to_device(self.onload_model_names)
         prompt_emb = self.encode_prompt(pipe, prompt)
         return {"context": prompt_emb}
+
+
+class WanVideoUnit_MLLMEmbedder(PipelineUnit):
+    def __init__(self):
+        super().__init__(
+            input_params=("prompt", "input_video", "context", "height", "width", "num_frames", "use_mllm_condition"),
+            output_params=("mllm_embeddings", "mllm_mask"),
+            onload_model_names=("mllm_encoder",)
+        )
+
+    def process(self, pipe: WanVideoPipeline, prompt, input_video, context, height, width, num_frames, use_mllm_condition=False):
+        if not use_mllm_condition or input_video is None or pipe.mllm_encoder is None:
+            return {}
+        if pipe.vae is None or pipe.dit is None:
+            return {}
+        pipe.load_models_to_device(self.onload_model_names)
+        frames = sample_mllm_frames(input_video, num_frames=num_frames)
+        mllm_embeddings = pipe.mllm_encoder.encode(prompt, frames)
+        if mllm_embeddings is None:
+            return {}
+        mllm_embeddings = mllm_embeddings.to(dtype=pipe.torch_dtype, device=pipe.device)
+        num_text_tokens = context.shape[1] if context is not None else mllm_embeddings.shape[1]
+        num_video_tokens = max(0, mllm_embeddings.shape[1] - num_text_tokens)
+        latent_h = height // pipe.vae.upsampling_factor
+        latent_w = width // pipe.vae.upsampling_factor
+        s_dit = (latent_h // pipe.dit.patch_size[1]) * (latent_w // pipe.dit.patch_size[2])
+        num_latent_frames = (num_frames - 1) // 4 + 1
+        num_dit_tokens = s_dit * num_latent_frames
+        mllm_steps = max(1, math.ceil(max(num_frames - 1, 0) / 16))
+        s_mllm = max(1, math.ceil(num_video_tokens / mllm_steps)) if num_video_tokens > 0 else 1
+        mllm_mask = compute_mllm_cross_attention_mask(
+            num_dit_tokens=num_dit_tokens,
+            num_text_tokens=num_text_tokens,
+            num_mllm_video_tokens=num_video_tokens,
+            s_dit=s_dit,
+            s_mllm=s_mllm,
+            device=pipe.device,
+        )
+        return {"mllm_embeddings": mllm_embeddings, "mllm_mask": mllm_mask}
 
 
 
@@ -1125,6 +1174,8 @@ def model_fn_wan_video(
     latents: torch.Tensor = None,
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
+    mllm_embeddings: torch.Tensor = None,
+    mllm_mask: torch.Tensor = None,
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
     reference_latents = None,
@@ -1150,6 +1201,7 @@ def model_fn_wan_video(
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
+    use_flex_attention: bool = False,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1231,6 +1283,15 @@ def model_fn_wan_video(
     if motion_bucket_id is not None and motion_controller is not None:
         t_mod = t_mod + motion_controller(motion_bucket_id).unflatten(1, (6, dit.dim))
     context = dit.text_embedding(context)
+    if mllm_embeddings is not None and dit.has_mllm_input:
+        mllm_embeddings = mllm_embeddings.to(device=latents.device, dtype=latents.dtype)
+        if mllm_embeddings.shape[0] != context.shape[0]:
+            repeat_factor = max(1, context.shape[0] // mllm_embeddings.shape[0])
+            mllm_embeddings = mllm_embeddings.repeat(repeat_factor, 1, 1)
+    if mllm_mask is not None and mllm_mask.dim() == 3 and dit.has_mllm_input:
+        if mllm_mask.shape[0] != context.shape[0]:
+            repeat_factor = max(1, context.shape[0] // mllm_mask.shape[0])
+            mllm_mask = mllm_mask.repeat(repeat_factor, 1, 1)
 
     x = latents
     # Merged cfg
@@ -1238,6 +1299,12 @@ def model_fn_wan_video(
         x = torch.concat([x] * context.shape[0], dim=0)
     if timestep.shape[0] != context.shape[0]:
         timestep = torch.concat([timestep] * context.shape[0], dim=0)
+    if mllm_embeddings is not None and dit.has_mllm_input and mllm_embeddings.shape[0] != context.shape[0]:
+        repeat_factor = max(1, context.shape[0] // mllm_embeddings.shape[0])
+        mllm_embeddings = mllm_embeddings.repeat(repeat_factor, 1, 1)
+    if mllm_mask is not None and mllm_mask.dim() == 3 and dit.has_mllm_input and mllm_mask.shape[0] != context.shape[0]:
+        repeat_factor = max(1, context.shape[0] // mllm_mask.shape[0])
+        mllm_mask = mllm_mask.repeat(repeat_factor, 1, 1)
 
     # Image Embedding
     if y is not None and dit.require_vae_embedding:
@@ -1346,17 +1413,17 @@ def model_fn_wan_video(
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, use_flex_attention,
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, use_flex_attention,
                         use_reentrant=False,
                     )
                 else:
-                    x = block(x, context, t_mod, freqs)
+                    x = block(x, context, t_mod, freqs, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask, use_flex_attention=use_flex_attention)
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:

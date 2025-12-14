@@ -5,6 +5,7 @@ import math
 from typing import Tuple, Optional
 from einops import rearrange
 from .wan_video_camera_controller import SimpleAdapter
+from ..core.attention import FLEX_ATTENTION_AVAILABLE, flex_cross_attention, make_score_mod_from_mask
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
@@ -147,7 +148,7 @@ class SelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6, has_image_input: bool = False):
+    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6, has_image_input: bool = False, has_mllm_input: bool = False):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -160,14 +161,35 @@ class CrossAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
         self.has_image_input = has_image_input
+        self.has_mllm_input = has_mllm_input
         if has_image_input:
             self.k_img = nn.Linear(dim, dim)
             self.v_img = nn.Linear(dim, dim)
             self.norm_k_img = RMSNorm(dim, eps=eps)
+        if has_mllm_input:
+            # Qwen3VL hidden size is 3584
+            self.k_mllm = nn.Linear(3584, dim)
+            self.v_mllm = nn.Linear(3584, dim)
+            self.norm_k_mllm = RMSNorm(dim, eps=eps)
             
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
+    def apply_attention(self, q, k, v, mask=None, use_flex_attention=False):
+        if mask is None:
+            return self.attn(q, k, v)
+        if use_flex_attention and FLEX_ATTENTION_AVAILABLE:
+            return flex_cross_attention(q, k, v, make_score_mod_from_mask(mask), num_heads=self.num_heads)
+        # fall back to SDPA, where mask=True indicates a masked position
+        sdpa_mask = mask
+        if use_flex_attention and mask.dtype == torch.bool:
+            sdpa_mask = ~mask
+        q_ = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+        k_ = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+        v_ = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
+        x = torch.nn.functional.scaled_dot_product_attention(q_, k_, v_, attn_mask=sdpa_mask)
+        return rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor, mllm_embeddings: Optional[torch.Tensor] = None, mllm_mask: Optional[torch.Tensor] = None, use_flex_attention: bool = False):
         if self.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
@@ -176,7 +198,22 @@ class CrossAttention(nn.Module):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(ctx))
         v = self.v(ctx)
-        x = self.attn(q, k, v)
+        attn_mask = None
+        allowed_mask = None
+        if self.has_mllm_input and mllm_embeddings is not None:
+            k_mllm = self.norm_k_mllm(self.k_mllm(mllm_embeddings))
+            v_mllm = self.v_mllm(mllm_embeddings)
+            k = torch.cat([k, k_mllm], dim=1)
+            v = torch.cat([v, v_mllm], dim=1)
+            if mllm_mask is not None:
+                allowed_mask = mllm_mask.bool()
+                if allowed_mask.dim() == 2:
+                    attn_mask = (~allowed_mask).unsqueeze(0).unsqueeze(0).expand(q.shape[0], self.num_heads, q.shape[1], k.shape[1])
+                elif allowed_mask.dim() == 3:
+                    attn_mask = (~allowed_mask).unsqueeze(1).expand(q.shape[0], self.num_heads, q.shape[1], k.shape[1])
+                else:
+                    attn_mask = allowed_mask
+        x = self.apply_attention(q, k, v, mask=allowed_mask if use_flex_attention else attn_mask, use_flex_attention=use_flex_attention)
         if self.has_image_input:
             k_img = self.norm_k_img(self.k_img(img))
             v_img = self.v_img(img)
@@ -193,7 +230,7 @@ class GateModule(nn.Module):
         return x + gate * residual
 
 class DiTBlock(nn.Module):
-    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
+    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6, has_mllm_input: bool = False):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -201,7 +238,7 @@ class DiTBlock(nn.Module):
 
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(
-            dim, num_heads, eps, has_image_input=has_image_input)
+            dim, num_heads, eps, has_image_input=has_image_input, has_mllm_input=has_mllm_input)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(dim, eps=eps)
@@ -210,7 +247,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, t_mod, freqs, mllm_embeddings=None, mllm_mask=None, use_flex_attention: bool = False):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -223,7 +260,7 @@ class DiTBlock(nn.Module):
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context)
+        x = x + self.cross_attn(self.norm3(x), context, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask, use_flex_attention=use_flex_attention)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -290,12 +327,14 @@ class WanModel(torch.nn.Module):
         require_vae_embedding: bool = True,
         require_clip_embedding: bool = True,
         fuse_vae_embedding_in_latents: bool = False,
+        has_mllm_input: bool = False,
     ):
         super().__init__()
         self.dim = dim
         self.in_dim = in_dim
         self.freq_dim = freq_dim
         self.has_image_input = has_image_input
+        self.has_mllm_input = has_mllm_input
         self.patch_size = patch_size
         self.seperated_timestep = seperated_timestep
         self.require_vae_embedding = require_vae_embedding
@@ -317,7 +356,7 @@ class WanModel(torch.nn.Module):
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
         self.blocks = nn.ModuleList([
-            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
+            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps, has_mllm_input=has_mllm_input)
             for _ in range(num_layers)
         ])
         self.head = Head(dim, out_dim, patch_size, eps)
@@ -356,8 +395,11 @@ class WanModel(torch.nn.Module):
                 context: torch.Tensor,
                 clip_feature: Optional[torch.Tensor] = None,
                 y: Optional[torch.Tensor] = None,
+                mllm_embeddings: Optional[torch.Tensor] = None,
+                mllm_mask: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
+                use_flex_attention: bool = False,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -389,17 +431,17 @@ class WanModel(torch.nn.Module):
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, use_flex_attention,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, use_flex_attention,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs)
+                x = block(x, context, t_mod, freqs, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask, use_flex_attention=use_flex_attention)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
