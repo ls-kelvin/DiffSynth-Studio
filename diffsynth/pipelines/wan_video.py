@@ -121,7 +121,6 @@ class WanVideoPipeline(BasePipeline):
                 "Wan2.2_VAE.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "Wan2.2_VAE.safetensors"),
             }
             for model_config in model_configs:
-                print(model_config)
                 if model_config.origin_file_pattern is None or model_config.model_id is None:
                     continue
                 if model_config.origin_file_pattern in redirect_dict and model_config.model_id != redirect_dict[model_config.origin_file_pattern][0]:
@@ -412,7 +411,6 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
         )
     
     def encode_prompt(self, pipe: WanVideoPipeline, prompt):
-        print(prompt)
         ids, mask = pipe.tokenizer(prompt, return_mask=True, add_special_tokens=True)
         ids = ids.to(pipe.device)
         mask = mask.to(pipe.device)
@@ -445,7 +443,6 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         if len(indices) % 2 != 0:
             indices = indices[:-1]
         video_metadata = [{"fps": 16, "frames_indices": indices, "total_num_frames": len(input_video)}]
-        print(f"MLLM input video metadata: {video_metadata}")
         input_video = [input_video[i] for i in indices]
         return input_video, video_metadata
         

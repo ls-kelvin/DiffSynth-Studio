@@ -7,8 +7,12 @@ from einops import rearrange
 from .wan_video_camera_controller import SimpleAdapter
 
 try:
+    import os
     from torch.nn.attention.flex_attention import flex_attention
-    FLEX_ATTENTION_AVAILABLE = True
+    if os.environ.get("DISABLE_FLEX_ATTENTION", "0") == "1":
+        FLEX_ATTENTION_AVAILABLE = False
+    else:
+        FLEX_ATTENTION_AVAILABLE = True
 except ImportError:
     FLEX_ATTENTION_AVAILABLE = False
 
