@@ -25,14 +25,15 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         min_timestep_boundary=0.0,
         use_mllm_condition=False,
         use_flex_attention=False,
+        mllm_processor_path=None,
     ):
         super().__init__()
         if not use_gradient_checkpointing:
             warnings.warn("Gradient checkpointing is detected as disabled. For MLLM training we enable it to avoid OOM.")
             use_gradient_checkpointing = True
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
-        tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
-        mllm_processor_config = ModelConfig(path="lib/Qwen3-VL-4B-Instruct") if use_mllm_condition else None
+        tokenizer_config = ModelConfig(path=tokenizer_path)
+        mllm_processor_config = ModelConfig(path=mllm_processor_path)
         # audio_processor_config = ModelConfig(model_id="Wan-AI/Wan2.2-S2V-14B", origin_file_pattern="wav2vec2-large-xlsr-53-english/") if audio_processor_path is None else ModelConfig(audio_processor_path)
         self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, mllm_processor_config=mllm_processor_config)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
@@ -117,6 +118,7 @@ def wan_parser():
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--use_mllm_condition", action="store_true", help="Enable MLLM conditioning.")
     parser.add_argument("--use_flex_attention", action="store_true", help="Use flex_attention for MLLM cross attention.")
+    parser.add_argument("--mllm_processor_path", type=str, default=None, help="Path to the MLLM processor.")  # 新增参数
     return parser
 
 
@@ -171,6 +173,7 @@ if __name__ == "__main__":
         min_timestep_boundary=args.min_timestep_boundary,
         use_mllm_condition=args.use_mllm_condition,
         use_flex_attention=args.use_flex_attention,
+        mllm_processor_path=args.mllm_processor_path,  # 新增参数
     )
     model_logger = ModelLogger(
         args.output_path,
