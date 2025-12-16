@@ -24,7 +24,6 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
         use_mllm_condition=False,
-        use_flex_attention=False,
         mllm_processor_path=None,
     ):
         super().__init__()
@@ -59,7 +58,6 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
         self.use_mllm_condition = use_mllm_condition
-        self.use_flex_attention = use_flex_attention
     
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
@@ -91,7 +89,6 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
             "max_timestep_boundary": self.max_timestep_boundary,
             "min_timestep_boundary": self.min_timestep_boundary,
             "use_mllm_condition": self.use_mllm_condition,
-            "use_flex_attention": self.use_flex_attention,
         }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         return inputs_shared, inputs_posi, inputs_nega
@@ -117,7 +114,6 @@ def wan_parser():
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--use_mllm_condition", action="store_true", help="Enable MLLM conditioning.")
-    parser.add_argument("--use_flex_attention", action="store_true", help="Use flex_attention for MLLM cross attention.")
     parser.add_argument("--mllm_processor_path", type=str, default=None, help="Path to the MLLM processor.")  # 新增参数
     return parser
 
@@ -172,7 +168,6 @@ if __name__ == "__main__":
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
         use_mllm_condition=args.use_mllm_condition,
-        use_flex_attention=args.use_flex_attention,
         mllm_processor_path=args.mllm_processor_path,  # 新增参数
     )
     model_logger = ModelLogger(

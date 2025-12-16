@@ -20,5 +20,4 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch examples/wanvideo/model_training/
   --lora_base_model "dit" \
   --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
   --lora_rank 32 \
-  --use_mllm_condition \
-  --use_flex_attention 
+  --use_mllm_condition 

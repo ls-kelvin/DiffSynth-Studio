@@ -229,7 +229,6 @@ class WanVideoPipeline(BasePipeline):
         width: Optional[int] = 832,
         num_frames=81,
         use_mllm_condition: Optional[bool] = False,
-        use_flex_attention: Optional[bool] = False,
         # Classifier-free guidance
         cfg_scale: Optional[float] = 5.0,
         cfg_merge: Optional[bool] = False,
@@ -279,7 +278,6 @@ class WanVideoPipeline(BasePipeline):
             "seed": seed, "rand_device": rand_device,
             "height": height, "width": width, "num_frames": num_frames,
             "use_mllm_condition": use_mllm_condition,
-            "use_flex_attention": use_flex_attention,
             "cfg_scale": cfg_scale, "cfg_merge": cfg_merge,
             "sigma_shift": sigma_shift,
             "motion_bucket_id": motion_bucket_id,
@@ -1297,7 +1295,6 @@ def model_fn_wan_video(
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
-    use_flex_attention: bool = False,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1393,6 +1390,12 @@ def model_fn_wan_video(
     if clip_feature is not None and dit.require_clip_embedding:
         clip_embdding = dit.img_emb(clip_feature)
         context = torch.cat([clip_embdding, context], dim=1)
+
+    # MLLM embeddings
+    if hasattr(dit, "has_mllm_input") and dit.has_mllm_input and mllm_hidden_states is not None:
+        mllm_embeddings = dit.mllm_embedding(mllm_hidden_states)
+    else:
+        mllm_embeddings = None
         
     # Camera control
     x = dit.patchify(x, control_camera_latents_input)
@@ -1494,17 +1497,17 @@ def model_fn_wan_video(
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, mllm_hidden_states, mllm_mask, use_flex_attention,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask,
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, mllm_hidden_states, mllm_mask, use_flex_attention,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask,
                         use_reentrant=False,
                     )
                 else:
-                    x = block(x, context, t_mod, freqs, mllm_hidden_states=mllm_hidden_states, mllm_mask=mllm_mask, use_flex_attention=use_flex_attention)
+                    x = block(x, context, t_mod, freqs, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask)
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:

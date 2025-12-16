@@ -184,7 +184,7 @@ class CrossAttention(nn.Module):
         self.attn = AttentionModule(self.num_heads)
         
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor, mllm_embeddings: Optional[torch.Tensor] = None, mllm_mask: Optional[torch.Tensor] = None, use_flex_attention: bool = False):
+    def forward(self, x: torch.Tensor, y: torch.Tensor, mllm_embeddings: Optional[torch.Tensor] = None, mllm_mask: Optional[torch.Tensor] = None):
         """Decoupled cross-attention: compute T5 cross-attention and MLLM cross-attention separately and sum."""
         if self.has_image_input:
             img = y[:, :257]
@@ -206,7 +206,7 @@ class CrossAttention(nn.Module):
             k_m = self.norm_k_mllm(self.k_mllm(mllm_embeddings))
             v_m = self.v_mllm(mllm_embeddings)
 
-            if use_flex_attention and FLEX_ATTENTION_AVAILABLE:
+            if FLEX_ATTENTION_AVAILABLE:
                 # Use flex_attention with mask
                 q_flex = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
                 k_flex = rearrange(k_m, "b s (n d) -> b n s d", n=self.num_heads)
@@ -285,7 +285,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs, mllm_embeddings: Optional[torch.Tensor] = None, mllm_mask: Optional[torch.Tensor] = None, use_flex_attention: bool = False):
+    def forward(self, x, context, t_mod, freqs, mllm_embeddings: Optional[torch.Tensor] = None, mllm_mask: Optional[torch.Tensor] = None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -298,7 +298,7 @@ class DiTBlock(nn.Module):
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask, use_flex_attention=use_flex_attention)
+        x = x + self.cross_attn(self.norm3(x), context, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -440,7 +440,6 @@ class WanModel(torch.nn.Module):
                 mllm_mask: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
-                use_flex_attention: bool = False,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -479,17 +478,17 @@ class WanModel(torch.nn.Module):
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, use_flex_attention,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, use_flex_attention,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask, use_flex_attention=use_flex_attention)
+                x = block(x, context, t_mod, freqs, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
