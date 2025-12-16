@@ -27,8 +27,7 @@ from ..models.wan_video_mot import MotWanModel
 from ..models.wav2vec import WanS2VAudioEncoder
 from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
 from ..models.wan_video_mllm_encoder import WanMLLMEncoder
-from ..models.wan_video_mllm_mask import compute_mllm_cross_attention_mask
-from ..utils.data import sample_mllm_frames
+from ..models.wan_video_mllm_encoder import Qwen3VLProcessor
 
 
 class WanVideoPipeline(BasePipeline):
@@ -53,6 +52,7 @@ class WanVideoPipeline(BasePipeline):
         self.animate_adapter: WanAnimateAdapter = None
         self.audio_encoder: WanS2VAudioEncoder = None
         self.mllm_encoder: WanMLLMEncoder = None
+        self.mllm_processor: Qwen3VLProcessor = None
         self.in_iteration_models = ("dit", "motion_controller", "vace", "animate_adapter", "vap")
         self.in_iteration_models_2 = ("dit2", "motion_controller", "vace2", "animate_adapter", "vap")
         self.units = [
@@ -107,7 +107,8 @@ class WanVideoPipeline(BasePipeline):
         model_configs: list[ModelConfig] = [],
         tokenizer_config: ModelConfig = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/"),
         audio_processor_config: ModelConfig = None,
-        redirect_common_files: bool = True,
+        mllm_processor_config: ModelConfig = None,
+        redirect_common_files: bool = False,
         use_usp: bool = False,
         vram_limit: float = None,
     ):
@@ -120,6 +121,7 @@ class WanVideoPipeline(BasePipeline):
                 "Wan2.2_VAE.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "Wan2.2_VAE.safetensors"),
             }
             for model_config in model_configs:
+                print(model_config)
                 if model_config.origin_file_pattern is None or model_config.model_id is None:
                     continue
                 if model_config.origin_file_pattern in redirect_dict and model_config.model_id != redirect_dict[model_config.origin_file_pattern][0]:
@@ -166,6 +168,9 @@ class WanVideoPipeline(BasePipeline):
         if audio_processor_config is not None:
             audio_processor_config.download_if_necessary()
             pipe.audio_processor = Wav2Vec2Processor.from_pretrained(audio_processor_config.path)
+        if mllm_processor_config is not None:
+            mllm_processor_config.download_if_necessary()
+            pipe.mllm_processor = Qwen3VLProcessor.from_pretrained(mllm_processor_config.path)
         
         # Unified Sequence Parallel
         if use_usp: pipe.enable_usp()
@@ -409,6 +414,7 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
         )
     
     def encode_prompt(self, pipe: WanVideoPipeline, prompt):
+        print(prompt)
         ids, mask = pipe.tokenizer(prompt, return_mask=True, add_special_tokens=True)
         ids = ids.to(pipe.device)
         mask = mask.to(pipe.device)
@@ -427,40 +433,130 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
 class WanVideoUnit_MLLMEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("prompt", "input_video", "context", "height", "width", "num_frames", "use_mllm_condition"),
-            output_params=("mllm_embeddings", "mllm_mask"),
+            seperate_cfg=True,
+            input_params_posi={"prompt": "prompt"},
+            input_params_nega={"prompt": "negative_prompt"},
+            input_params=("input_video", "context", "height", "width", "num_frames", "use_mllm_condition"),
+            output_params=("mllm_hidden_states", "mllm_mask"),
             onload_model_names=("mllm_encoder",)
         )
+    
+    def process_video_for_mllm(self, pipe: WanVideoPipeline, input_video):
+        indices = list(range(8, len(input_video), 8))
+        # Ensure indices are even in length; if odd, remove the last one
+        if len(indices) % 2 != 0:
+            indices = indices[:-1]
+        video_metadata = [{"fps": 16, "frames_indices": indices, "total_num_frames": len(input_video)}]
+        print(f"MLLM input video metadata: {video_metadata}")
+        input_video = [input_video[i] for i in indices]
+        return input_video, video_metadata
+        
+    def encode_prompt(self, pipe: WanVideoPipeline, prompt, input_video, video_metadata):
+        template = "<|im_start|>system\nAnalyze the provided context (either a text description for the first frame or a sequence of preceding video frames). Describe the key visual elements, ongoing motion, camera perspective, and overall scene composition. Then, based on the user's instruction, predict the visual content and dynamics of the next frame(s). Ensure the prediction maintains temporal coherence, logical progression, and consistency with the established style and action.<|im_end|>\n<|im_start|>user\n{}<|vision_start|><|video_pad|><|vision_end|>"
+        drop_idx = 87 # index of the begining of user instruction
+        txt = [template.format(prompt)]
+        model_inputs = pipe.mllm_processor(text=txt, videos=input_video, padding=True, video_metadata=video_metadata, return_tensors="pt", do_resize=False, do_sample_frames=False).to(pipe.device)
+        hidden_states = pipe.mllm_encoder(**model_inputs)[-1]
+        hidden_states = hidden_states[:, drop_idx:]
+        # Return both hidden_states and input_ids for mask calculation
+        return hidden_states, model_inputs["input_ids"][:, drop_idx:]
+    
+    def calculate_mllm_mask(self, pipe: WanVideoPipeline, num_frames, height, width, mllm_hidden_states, input_ids):
+        """
+        Calculate the cross-attention mask for MLLM embeddings based on temporal causality.
+        
+        The mask ensures that DiT tokens at time t can only attend to MLLM tokens up to time t.
+        
+        Key points from Instruction.md:
+        - DiT spatial tokens per frame: S_dit = (height // 16) * (width // 16)
+        - DiT has 1 frame for frame 0, then blocks of 4 frames
+        - 4 * S_dit tokens make up a block representing 1 second (16 frames at fps=16)
+        - MLLM video tokens: each 1s video produces S_mllm tokens (after 2x temporal merge)
+        - First vision_end includes the first 1s video, NOT just text
+        
+        Args:
+            pipe: Pipeline object
+            num_frames: Total number of video frames to generate
+            height: Video height
+            width: Video width  
+            mllm_hidden_states: MLLM hidden states tensor of shape (B, seq_len, D)
+            input_ids: Token IDs from processor to find vision token positions
+            
+        Returns:
+            mask: Boolean tensor of shape (num_dit_tokens, mllm_seq_len) where True means can attend
+        """
+        # Calculate spatial dimensions: VAE factor 8 * patch size 2 = 16
+        lat_h = height // 16
+        lat_w = width // 16
+        S_dit = lat_h * lat_w  # Spatial tokens per frame in DiT
+        
+        # DiT structure: first frame takes 1 slot, then every 4 frames take 1 slot
+        num_dit_frames = 1 + (num_frames - 1) // 4
+        num_dit_tokens = num_dit_frames * S_dit
+        
+        mllm_seq_len = mllm_hidden_states.shape[1]
+        
+        # Find vision_start and vision_end token positions
+        vision_start_token_id = pipe.mllm_encoder.config.vision_start_token_id
+        vision_end_token_id = pipe.mllm_encoder.config.vision_end_token_id
+        
+        vision_start_positions = (input_ids[0] == vision_start_token_id).nonzero(as_tuple=True)[0]
+        vision_end_positions = (input_ids[0] == vision_end_token_id).nonzero(as_tuple=True)[0]
+        
+        # Create mask: (num_dit_tokens, mllm_seq_len)
+        mask = torch.zeros((num_dit_tokens, mllm_seq_len), device=mllm_hidden_states.device, dtype=torch.bool)
+        
+        # Find text end: position before the first vision_start token
+        if len(vision_start_positions) > 0:
+            text_end = vision_start_positions[0].item() - 6
+        else:
+            # No vision tokens, all are text
+            text_end = mllm_seq_len
+        
+        # Frame 0 (first S_dit tokens): can only attend to text
+        mask[:S_dit, :text_end] = True
+        
+        # Frame block 1 (4 latent frames = frames 1-16): also only text, no video condition
+        # According to instruction: "dit first generate the first latent frame which correspond to frame 0,
+        # then generate the next block of 4 latent frames, which correspond to video frames 1-16 with no mllm video condition"
+        if num_dit_frames > 1:
+            mask[S_dit:5*S_dit, :text_end] = True
+        
+        # For subsequent DiT blocks (i >= 5), they can attend to text + video up to their time
+        # Each block of 4 latent frames corresponds to 1 second of video
+        # vision_end_positions mark the end of each 1s video segment in MLLM
+        # Block starting at frame i can see up to (i-5)/4 complete 1s video segments
+        for i in range(5, num_dit_frames):
+            start_dit = i * S_dit
+            end_dit = (i + 1) * S_dit
+            
+            # Calculate how many complete 1s video segments this block can see
+            # Blocks 5-8 generate frames for 2nd second, can see 1st second video
+            # Blocks 9-12 generate frames for 3rd second, can see 1st and 2nd second video
+            visible_segments = (i - 1) // 4
+            
+            if visible_segments > 0 and visible_segments <= len(vision_end_positions):
+                # Can attend up to and including the visible_segments-th vision_end
+                end_mllm = vision_end_positions[visible_segments - 1].item() + 1
+            else:
+                # Can see all available MLLM tokens
+                end_mllm = mllm_seq_len
+            
+            mask[start_dit:end_dit, :end_mllm] = True
+        
+        # Add batch dimension
+        mask = mask.unsqueeze(0)  # (1, num_dit_tokens, mllm_seq_len)
+        
+        return mask
 
     def process(self, pipe: WanVideoPipeline, prompt, input_video, context, height, width, num_frames, use_mllm_condition=False):
-        if not use_mllm_condition or input_video is None or pipe.mllm_encoder is None:
-            return {}
-        if pipe.vae is None or pipe.dit is None:
+        if not use_mllm_condition:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        frames = sample_mllm_frames(input_video, num_frames=num_frames)
-        mllm_embeddings = pipe.mllm_encoder.encode(prompt, frames)
-        if mllm_embeddings is None:
-            return {}
-        mllm_embeddings = mllm_embeddings.to(dtype=pipe.torch_dtype, device=pipe.device)
-        num_text_tokens = context.shape[1] if context is not None else mllm_embeddings.shape[1]
-        num_video_tokens = max(0, mllm_embeddings.shape[1] - num_text_tokens)
-        latent_h = height // pipe.vae.upsampling_factor
-        latent_w = width // pipe.vae.upsampling_factor
-        s_dit = (latent_h // pipe.dit.patch_size[1]) * (latent_w // pipe.dit.patch_size[2])
-        num_latent_frames = (num_frames - 1) // 4 + 1
-        num_dit_tokens = s_dit * num_latent_frames
-        mllm_steps = max(1, math.ceil(max(num_frames - 1, 0) / 16))
-        s_mllm = max(1, math.ceil(num_video_tokens / mllm_steps)) if num_video_tokens > 0 else 1
-        mllm_mask = compute_mllm_cross_attention_mask(
-            num_dit_tokens=num_dit_tokens,
-            num_text_tokens=num_text_tokens,
-            num_mllm_video_tokens=num_video_tokens,
-            s_dit=s_dit,
-            s_mllm=s_mllm,
-            device=pipe.device,
-        )
-        return {"mllm_embeddings": mllm_embeddings, "mllm_mask": mllm_mask}
+        mllm_video, video_metadata = self.process_video_for_mllm(pipe, input_video)
+        mllm_hidden_states, input_ids = self.encode_prompt(pipe, prompt, mllm_video, video_metadata)
+        mllm_mask = self.calculate_mllm_mask(pipe, num_frames, height, width, mllm_hidden_states, input_ids)
+        return {"mllm_hidden_states": mllm_hidden_states, "mllm_mask": mllm_mask}
 
 
 
@@ -1174,7 +1270,7 @@ def model_fn_wan_video(
     latents: torch.Tensor = None,
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
-    mllm_embeddings: torch.Tensor = None,
+    mllm_hidden_states: torch.Tensor = None,
     mllm_mask: torch.Tensor = None,
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
@@ -1283,15 +1379,6 @@ def model_fn_wan_video(
     if motion_bucket_id is not None and motion_controller is not None:
         t_mod = t_mod + motion_controller(motion_bucket_id).unflatten(1, (6, dit.dim))
     context = dit.text_embedding(context)
-    if mllm_embeddings is not None and dit.has_mllm_input:
-        mllm_embeddings = mllm_embeddings.to(device=latents.device, dtype=latents.dtype)
-        if mllm_embeddings.shape[0] != context.shape[0]:
-            repeat_factor = max(1, context.shape[0] // mllm_embeddings.shape[0])
-            mllm_embeddings = mllm_embeddings.repeat(repeat_factor, 1, 1)
-    if mllm_mask is not None and mllm_mask.dim() == 3 and dit.has_mllm_input:
-        if mllm_mask.shape[0] != context.shape[0]:
-            repeat_factor = max(1, context.shape[0] // mllm_mask.shape[0])
-            mllm_mask = mllm_mask.repeat(repeat_factor, 1, 1)
 
     x = latents
     # Merged cfg
@@ -1299,12 +1386,6 @@ def model_fn_wan_video(
         x = torch.concat([x] * context.shape[0], dim=0)
     if timestep.shape[0] != context.shape[0]:
         timestep = torch.concat([timestep] * context.shape[0], dim=0)
-    if mllm_embeddings is not None and dit.has_mllm_input and mllm_embeddings.shape[0] != context.shape[0]:
-        repeat_factor = max(1, context.shape[0] // mllm_embeddings.shape[0])
-        mllm_embeddings = mllm_embeddings.repeat(repeat_factor, 1, 1)
-    if mllm_mask is not None and mllm_mask.dim() == 3 and dit.has_mllm_input and mllm_mask.shape[0] != context.shape[0]:
-        repeat_factor = max(1, context.shape[0] // mllm_mask.shape[0])
-        mllm_mask = mllm_mask.repeat(repeat_factor, 1, 1)
 
     # Image Embedding
     if y is not None and dit.require_vae_embedding:
@@ -1413,17 +1494,17 @@ def model_fn_wan_video(
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, use_flex_attention,
+                            x, context, t_mod, freqs, mllm_hidden_states, mllm_mask, use_flex_attention,
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, use_flex_attention,
+                        x, context, t_mod, freqs, mllm_hidden_states, mllm_mask, use_flex_attention,
                         use_reentrant=False,
                     )
                 else:
-                    x = block(x, context, t_mod, freqs, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask, use_flex_attention=use_flex_attention)
+                    x = block(x, context, t_mod, freqs, mllm_hidden_states=mllm_hidden_states, mllm_mask=mllm_mask, use_flex_attention=use_flex_attention)
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:

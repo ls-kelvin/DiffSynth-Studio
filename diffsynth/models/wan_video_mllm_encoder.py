@@ -1,55 +1,116 @@
 import torch
 from torch import nn
-from typing import List, Optional, Sequence, Union
+from typing import Optional
 
-from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
-
-from ..utils.data import MLLM_SYSTEM_PROMPT, video_to_pil_frames
+from transformers import Qwen3VLConfig, Qwen3VLModel, Qwen3VLProcessor
 
 
 class WanMLLMEncoder(nn.Module):
-    def __init__(self, model_path: str, torch_dtype: torch.dtype = torch.bfloat16, enable_gradient_checkpointing: bool = False, device: Optional[Union[str, torch.device]] = None):
+    """
+    Qwen3-VL backbone wrapped for DiffSynth. Follows the integration style of Qwen-Image text encoder:
+    the model is instantiated from an explicit config instead of using from_pretrained.
+    """
+
+    def __init__(self, torch_dtype: torch.dtype = torch.bfloat16):
         super().__init__()
+        config = Qwen3VLConfig(**{
+            "architectures": [
+                "Qwen3VLForConditionalGeneration"
+            ],
+            "image_token_id": 151655,
+            "model_type": "qwen3_vl",
+            "text_config": {
+                "attention_bias": False,
+                "attention_dropout": 0.0,
+                "bos_token_id": 151643,
+                "dtype": "bfloat16",
+                "eos_token_id": 151645,
+                "head_dim": 128,
+                "hidden_act": "silu",
+                "hidden_size": 2560,
+                "initializer_range": 0.02,
+                "intermediate_size": 9728,
+                "max_position_embeddings": 262144,
+                "model_type": "qwen3_vl_text",
+                "num_attention_heads": 32,
+                "num_hidden_layers": 36,
+                "num_key_value_heads": 8,
+                "rms_norm_eps": 1e-06,
+                "rope_scaling": {
+                "mrope_interleaved": True,
+                "mrope_section": [
+                    24,
+                    20,
+                    20
+                ],
+                "rope_type": "default"
+                },
+                "rope_theta": 5000000,
+                "tie_word_embeddings": True,
+                "use_cache": True,
+                "vocab_size": 151936
+            },
+            "tie_word_embeddings": True,
+            "transformers_version": "4.57.0.dev0",
+            "video_token_id": 151656,
+            "vision_config": {
+                "deepstack_visual_indexes": [
+                5,
+                11,
+                17
+                ],
+                "depth": 24,
+                "hidden_act": "gelu_pytorch_tanh",
+                "hidden_size": 1024,
+                "in_channels": 3,
+                "initializer_range": 0.02,
+                "intermediate_size": 4096,
+                "model_type": "qwen3_vl",
+                "num_heads": 16,
+                "num_position_embeddings": 2304,
+                "out_hidden_size": 2560,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2
+            },
+            "vision_end_token_id": 151653,
+            "vision_start_token_id": 151652
+            }
+        )
+        self.model = Qwen3VLModel(config)
+        self.config = config
         self.torch_dtype = torch_dtype
-        self.device = device
-        self.processor = Qwen3VLProcessor.from_pretrained(model_path, trust_remote_code=True)
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch_dtype, device_map=None)
-        if device is not None:
-            self.model.to(device)
-        if enable_gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-        self.model.eval()
 
-    def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
-        self.model.to(*args, **kwargs)
-        device, dtype, _, _ = torch._C._nn._parse_to(*args, **kwargs)
-        if device is not None:
-            self.device = device
-        if dtype is not None:
-            self.torch_dtype = dtype
-        return self
-
-    def build_prompt(self, text_prompt: str) -> str:
-        return MLLM_SYSTEM_PROMPT + text_prompt + "<|im_end|>"
-
-    @torch.no_grad()
-    def encode(self, text_prompt: Union[str, List[str]], video_frames: Union[Sequence, torch.Tensor]) -> Optional[torch.Tensor]:
-        if isinstance(text_prompt, str):
-            prompts = [text_prompt]
-        else:
-            prompts = text_prompt
-        videos = [video_to_pil_frames(video_frames)]
-        chat_prompts = [self.build_prompt(p) for p in prompts]
-        inputs = self.processor(text=chat_prompts, videos=videos, return_tensors="pt")
-        if self.device is not None:
-            inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-        outputs = self.model(**inputs, output_hidden_states=True)
-        hidden_states = outputs.hidden_states[-1]
-        return self.extract_multimodal_embeddings(hidden_states, inputs.get("attention_mask"))
-
-    def extract_multimodal_embeddings(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
-        if attention_mask is not None:
-            max_len = attention_mask.sum(dim=1).max().item()
-            hidden_states = hidden_states[:, :max_len]
-        return hidden_states
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values=None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        rope_deltas: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            rope_deltas=rope_deltas,
+            cache_position=cache_position,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+            **kwargs,
+        )
+        return outputs.hidden_states

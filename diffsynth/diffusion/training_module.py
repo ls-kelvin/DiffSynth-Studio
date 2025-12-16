@@ -180,8 +180,12 @@ class DiffusionTrainingModule(torch.nn.Module):
             setattr(pipe, lora_base_model, model)
         # Enable training for newly added MLLM projection layers
         if hasattr(pipe, "dit") and getattr(pipe, "dit") is not None:
+            module = getattr(pipe.dit, "mllm_embedding", None)
+            if module is not None:
+                for param in module.parameters():
+                    param.requires_grad = True
             for block in pipe.dit.blocks:
-                for name in ("k_mllm", "v_mllm", "norm_k_mllm"):
+                for name in ("k_mllm", "v_mllm", "norm_k_mllm", "fuse_linear"):
                     module = getattr(block.cross_attn, name, None)
                     if module is not None:
                         for param in module.parameters():

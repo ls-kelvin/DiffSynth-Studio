@@ -10,7 +10,7 @@ authors = [{name = "ModelScope Team"}]
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10,<3.11"
 dependencies = [
-    "torch>=2.7.0,<2.8.0",
+    "torch==2.6.0",
     "torchvision",
     "transformers",
     "imageio",
@@ -25,7 +25,12 @@ dependencies = [
     "accelerate",
     "peft",
     "datasets",
-    "flash-attn>=2.8.3",
+    "pyarrow==18.0.0",
+    "diffusers>=0.36.0",
+    "qwen-vl-utils>=0.0.14",
+    "deepspeed>=0.18.3",
+    "nvitop>=1.6.1",
+    "ipykernel>=7.1.0",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -33,11 +38,11 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
-[tool.setuptools.packages.find]
-
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
+
+[tool.setuptools.packages.find]
 
 [tool.setuptools]
 include-package-data = true

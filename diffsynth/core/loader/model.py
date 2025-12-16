@@ -10,8 +10,8 @@ def load_model(model_class, path, config=None, torch_dtype=torch.bfloat16, devic
     # Why do we use `skip_model_initialization`?
     # It skips the random initialization of model parameters,
     # thereby speeding up model loading and avoiding excessive memory usage.
-    with skip_model_initialization():
-        model = model_class(**config)
+    # with skip_model_initialization():
+    model = model_class(**config)
     # What is `module_map`?
     # This is a module mapping table for VRAM management.
     if module_map is not None:

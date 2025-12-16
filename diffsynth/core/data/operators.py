@@ -104,12 +104,13 @@ class ToList(DataProcessingOperator):
     
 
 class LoadVideo(DataProcessingOperator):
-    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x):
+    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x, fps=None):
         self.num_frames = num_frames
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
         # frame_processor is build in the video loader for high efficiency.
         self.frame_processor = frame_processor
+        self.fps = fps
         
     def get_num_frames(self, reader):
         num_frames = self.num_frames
@@ -122,8 +123,25 @@ class LoadVideo(DataProcessingOperator):
     def __call__(self, data: str):
         reader = imageio.get_reader(data)
         num_frames = self.get_num_frames(reader)
+        
+        # Get original fps if fps parameter is set
+        original_fps = None
+        if self.fps is not None:
+            original_fps = reader.get_meta_data()['fps']
+        
         frames = []
-        for frame_id in range(num_frames):
+        total_frames = int(reader.count_frames())
+        
+        # Calculate frame indices based on fps resampling
+        if self.fps is not None and original_fps is not None and original_fps != self.fps:
+            # Calculate resampling factor
+            resample_factor = original_fps / self.fps
+            frame_indices = [round(i * resample_factor) for i in range(num_frames) if round(i * resample_factor) < total_frames]
+            frame_indices = frame_indices[:num_frames]
+        else:
+            frame_indices = list(range(num_frames))
+        
+        for frame_id in frame_indices:
             frame = reader.get_data(frame_id)
             frame = Image.fromarray(frame)
             frame = self.frame_processor(frame)
@@ -141,12 +159,13 @@ class SequencialProcess(DataProcessingOperator):
 
 
 class LoadGIF(DataProcessingOperator):
-    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x):
+    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x, fps=None):
         self.num_frames = num_frames
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
         # frame_processor is build in the video loader for high efficiency.
         self.frame_processor = frame_processor
+        self.fps = fps
         
     def get_num_frames(self, path):
         num_frames = self.num_frames
@@ -159,14 +178,33 @@ class LoadGIF(DataProcessingOperator):
         
     def __call__(self, data: str):
         num_frames = self.get_num_frames(data)
-        frames = []
         images = iio.imread(data, mode="RGB")
-        for img in images:
-            frame = Image.fromarray(img)
+        total_frames = len(images)
+        
+        # Get original fps if fps parameter is set
+        original_fps = None
+        if self.fps is not None:
+            try:
+                props = iio.improps(data)
+                original_fps = props.get('fps', None)
+            except:
+                pass
+        
+        frames = []
+        
+        # Calculate frame indices based on fps resampling
+        if self.fps is not None and original_fps is not None and original_fps != self.fps:
+            # Calculate resampling factor
+            resample_factor = original_fps / self.fps
+            frame_indices = [int(i * resample_factor) for i in range(num_frames) if int(i * resample_factor) < total_frames]
+            frame_indices = frame_indices[:num_frames]
+        else:
+            frame_indices = list(range(min(num_frames, total_frames)))
+        
+        for frame_id in frame_indices:
+            frame = Image.fromarray(images[frame_id])
             frame = self.frame_processor(frame)
             frames.append(frame)
-            if len(frames) >= num_frames:
-                break
         return frames
 
 

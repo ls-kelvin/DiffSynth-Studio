@@ -1,2 +1,1 @@
 from .attention import attention_forward
-from .flex_attention import FLEX_ATTENTION_AVAILABLE, flex_cross_attention, make_score_mod_from_mask

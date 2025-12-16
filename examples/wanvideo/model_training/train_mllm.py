@@ -32,8 +32,9 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
             use_gradient_checkpointing = True
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
         tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
-        audio_processor_config = ModelConfig(model_id="Wan-AI/Wan2.2-S2V-14B", origin_file_pattern="wav2vec2-large-xlsr-53-english/") if audio_processor_path is None else ModelConfig(audio_processor_path)
-        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
+        mllm_processor_config = ModelConfig(path="lib/Qwen3-VL-4B-Instruct") if use_mllm_condition else None
+        # audio_processor_config = ModelConfig(model_id="Wan-AI/Wan2.2-S2V-14B", origin_file_pattern="wav2vec2-large-xlsr-53-english/") if audio_processor_path is None else ModelConfig(audio_processor_path)
+        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, mllm_processor_config=mllm_processor_config)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         self.switch_pipe_to_training_mode(
             self.pipe, trainable_models,
@@ -98,6 +99,7 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         if inputs is None:
             inputs = self.get_pipeline_inputs(data)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
+        print(inputs[1]['prompt'])
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         loss = self.task_to_loss[self.task](self.pipe, *inputs)

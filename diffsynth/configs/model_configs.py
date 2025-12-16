@@ -1,3 +1,5 @@
+import torch
+
 qwen_image_series = [
     {
         # Example: ModelConfig(model_id="Qwen/Qwen-Image", origin_file_pattern="text_encoder/model*.safetensors")
@@ -126,7 +128,7 @@ wan_series = [
         "model_hash": "9269f8db9040a9d860eaca435be61814",
         "model_name": "wan_video_dit",
         "model_class": "diffsynth.models.wan_video_dit.WanModel",
-        "extra_kwargs": {'has_image_input': False, 'patch_size': [1, 2, 2], 'in_dim': 16, 'dim': 1536, 'ffn_dim': 8960, 'freq_dim': 256, 'text_dim': 4096, 'out_dim': 16, 'num_heads': 12, 'num_layers': 30, 'eps': 1e-06}
+        "extra_kwargs": {'has_image_input': False, 'patch_size': [1, 2, 2], 'in_dim': 16, 'dim': 1536, 'ffn_dim': 8960, 'freq_dim': 256, 'text_dim': 4096, 'out_dim': 16, 'num_heads': 12, 'num_layers': 30, 'eps': 1e-06, 'has_mllm_input': True}
     },
     {
         # Example: ModelConfig(model_id="Wan-AI/Wan2.1-FLF2V-14B-720P", origin_file_pattern="diffusion_pytorch_model*.safetensors")
@@ -294,11 +296,10 @@ wan_series = [
         "state_dict_converter": "diffsynth.utils.state_dict_converters.wans2v_audio_encoder.WanS2VAudioEncoderStateDictConverter",
     },
     {
-        "model_hash": "wan_mllm_encoder",
+        "model_hash": "b8750c24f732c87797f551196c4cef78",
         "model_name": "wan_mllm_encoder",
         "model_class": "diffsynth.models.wan_video_mllm_encoder.WanMLLMEncoder",
-        "extra_kwargs": {"torch_dtype": "bfloat16"},
-        "allow_any_hash": True,
+        "state_dict_converter": "diffsynth.utils.state_dict_converters.wan_video_mllm_encoder.WanMLLMEncoderStateDictConverter",
     },
 ]
 
