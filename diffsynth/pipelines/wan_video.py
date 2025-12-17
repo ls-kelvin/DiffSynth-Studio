@@ -1,4 +1,4 @@
-import torch, types, math
+import torch, types, math, os
 import numpy as np
 from PIL import Image
 from einops import repeat
@@ -28,6 +28,13 @@ from ..models.wav2vec import WanS2VAudioEncoder
 from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
 from ..models.wan_video_mllm_encoder import WanMLLMEncoder
 from ..models.wan_video_mllm_encoder import Qwen3VLProcessor
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask as flex_create_block_mask
+    FLEX_ATTENTION_AVAILABLE = os.environ.get("DISABLE_FLEX_ATTENTION", "0") != "1"
+except ImportError:
+    FLEX_ATTENTION_AVAILABLE = False
+    flex_create_block_mask = None
 
 
 class WanVideoPipeline(BasePipeline):
@@ -1419,6 +1426,28 @@ def model_fn_wan_video(
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
+    mllm_block_mask = None
+    if (
+        FLEX_ATTENTION_AVAILABLE
+        and flex_create_block_mask is not None
+        and mllm_embeddings is not None
+        and mllm_mask is not None
+    ):
+        allowed = mllm_mask.to(device=x.device, dtype=torch.bool).contiguous()
+        B, Q_LEN, KV_LEN = allowed.shape
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return allowed[b, q_idx, kv_idx]
+
+        mllm_block_mask = flex_create_block_mask(
+            mask_mod,
+            B=B,
+            H=dit.num_heads,
+            Q_LEN=Q_LEN,
+            KV_LEN=KV_LEN,
+            device=str(x.device),
+        )
+
     # VAP 
     if vap is not None:
         # hidden state
@@ -1494,17 +1523,22 @@ def model_fn_wan_video(
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask,
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask,
                         use_reentrant=False,
                     )
                 else:
-                    x = block(x, context, t_mod, freqs, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask)
+                    x = block(
+                        x, context, t_mod, freqs,
+                        mllm_embeddings=mllm_embeddings,
+                        mllm_mask=mllm_mask,
+                        mllm_block_mask=mllm_block_mask,
+                    )
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:

@@ -8,13 +8,32 @@ from .wan_video_camera_controller import SimpleAdapter
 
 try:
     import os
-    from torch.nn.attention.flex_attention import flex_attention
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    
     if os.environ.get("DISABLE_FLEX_ATTENTION", "0") == "1":
-        FLEX_ATTENTION_AVAILABLE = False
+        USE_FLEX_ATTENTION = False
     else:
-        FLEX_ATTENTION_AVAILABLE = True
+        USE_FLEX_ATTENTION = True
+
+    # 默认开启 compile（可用 FLEX_ATTENTION_COMPILE=0 关闭）
+    _FLEX_COMPILE_ENABLED = os.environ.get("FLEX_ATTENTION_COMPILE", "1") == "1"
+    _FLEX_ATTN_COMPILED = None
+
+    def _flex_attention_call(q, k, v, *, block_mask=None, score_mod=None, kernel_options=None):
+        global _FLEX_ATTN_COMPILED
+        if _FLEX_COMPILE_ENABLED:
+            if _FLEX_ATTN_COMPILED is None:
+                _FLEX_ATTN_COMPILED = torch.compile(flex_attention)
+            return _FLEX_ATTN_COMPILED(q, k, v, block_mask=block_mask, score_mod=score_mod, kernel_options=kernel_options)
+        return flex_attention(q, k, v, block_mask=block_mask, score_mod=score_mod, kernel_options=kernel_options)
+
 except ImportError:
-    FLEX_ATTENTION_AVAILABLE = False
+    USE_FLEX_ATTENTION = False
+    create_block_mask = None
+
+    def _flex_attention_call(*args, **kwargs):
+        raise RuntimeError("flex_attention is not available in this PyTorch build.")
+
 
 try:
     import flash_attn_interface
@@ -188,13 +207,20 @@ class CrossAttention(nn.Module):
         self.attn = AttentionModule(self.num_heads)
         
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor, mllm_embeddings: Optional[torch.Tensor] = None, mllm_mask: Optional[torch.Tensor] = None):
-        """Decoupled cross-attention: compute T5 cross-attention and MLLM cross-attention separately and sum."""
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        mllm_embeddings: Optional[torch.Tensor] = None,
+        mllm_mask: Optional[torch.Tensor] = None,          # 仍保留给 SDPA fallback 用
+        mllm_block_mask: Optional[object] = None,          # flex 用：在 WanModel.forward 里只构建一次
+    ):
         if self.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
         else:
             ctx = y
+
         q = self.norm_q(self.q(x))
 
         # T5 cross-attention
@@ -205,55 +231,26 @@ class CrossAttention(nn.Module):
         x = x_t5
 
         # MLLM decoupled attention
-        if self.has_mllm_input and mllm_embeddings is not None:
-            # mllm_embeddings expected to be already projected to model dim (done in outer layer)
+        if self.has_mllm_input and (mllm_embeddings is not None):
             k_m = self.norm_k_mllm(self.k_mllm(mllm_embeddings))
             v_m = self.v_mllm(mllm_embeddings)
 
-            if FLEX_ATTENTION_AVAILABLE:
-                # Use flex_attention with mask
-                q_flex = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
-                k_flex = rearrange(k_m, "b s (n d) -> b n s d", n=self.num_heads)
-                v_flex = rearrange(v_m, "b s (n d) -> b n s d", n=self.num_heads)
-                
-                # Create score_mod function from mask if provided
-                score_mod = None
-                if mllm_mask is not None:
-                    mask_bool = mllm_mask.bool()
-                    def score_mod_fn(score, b, h, q_idx, kv_idx):
-                        if mask_bool.dim() == 2:
-                            # Shape (q_len, kv_len)
-                            return torch.where(mask_bool[q_idx, kv_idx], score, float("-inf"))
-                        elif mask_bool.dim() == 3:
-                            # Shape (B, q_len, kv_len)
-                            return torch.where(mask_bool[b, q_idx, kv_idx], score, float("-inf"))
-                        else:
-                            # Shape (B, num_heads, q_len, kv_len)
-                            return torch.where(mask_bool[b, h, q_idx, kv_idx], score, float("-inf"))
-                    score_mod = score_mod_fn
-                
-                x_mllm = flex_attention(q_flex, k_flex, v_flex, score_mod=score_mod)
-                x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
+            q_h = rearrange(q,   "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+            k_h = rearrange(k_m, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+            v_h = rearrange(v_m, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+
+            # Flex 路径：使用“外部一次性构建”的 block_mask
+            if USE_FLEX_ATTENTION and (mllm_block_mask is not None):
+                x_mllm = _flex_attention_call(q_h, k_h, v_h, block_mask=mllm_block_mask)
             else:
-                print("Flex attention is not available. Please install a PyTorch version with flex attention support.")
-                # Fallback to standard attention with mask
+                # SDPA fallback（你的 mllm_mask 保证是 (B, Q, KV)）
                 attn_mask = None
                 if mllm_mask is not None:
-                    allowed_mask = mllm_mask.bool()
-                    if allowed_mask.dim() == 2:
-                        attn_mask = (~allowed_mask).unsqueeze(0).unsqueeze(0).expand(q.shape[0], self.num_heads, q.shape[1], k_m.shape[1])
-                    elif allowed_mask.dim() == 3:
-                        # shape (B, q_len, kv_len) -> expand to (B, num_heads, q_len, kv_len)
-                        attn_mask = (~allowed_mask).unsqueeze(1).expand(q.shape[0], self.num_heads, q.shape[1], k_m.shape[1])
-                    else:
-                        attn_mask = ~allowed_mask
-                
-                q_attn = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
-                k_attn = rearrange(k_m, "b s (n d) -> b n s d", n=self.num_heads)
-                v_attn = rearrange(v_m, "b s (n d) -> b n s d", n=self.num_heads)
-                x_mllm = F.scaled_dot_product_attention(q_attn, k_attn, v_attn, attn_mask=attn_mask)
-                x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
-            
+                    allowed = mllm_mask.to(device=q.device, dtype=torch.bool)
+                    attn_mask = (~allowed).unsqueeze(1).expand(q_h.shape[0], self.num_heads, q_h.shape[2], k_h.shape[2])
+                x_mllm = F.scaled_dot_product_attention(q_h, k_h, v_h, attn_mask=attn_mask)
+
+            x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
             x = x + self.fuse_linear(x_mllm)
 
         # Image cross-attention (if available)
@@ -262,6 +259,7 @@ class CrossAttention(nn.Module):
             v_img = self.v_img(img)
             y_img = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
             x = x + y_img
+            
         return self.o(x)
 
 class GateModule(nn.Module):
@@ -289,23 +287,44 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs, mllm_embeddings: Optional[torch.Tensor] = None, mllm_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x,
+        context,
+        t_mod,
+        freqs,
+        mllm_embeddings: Optional[torch.Tensor] = None,
+        mllm_mask: Optional[torch.Tensor] = None,
+        mllm_block_mask: Optional[object] = None,
+    ):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=chunk_dim)
+            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
+        ).chunk(6, dim=chunk_dim)
+
         if has_seq:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                 shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
+
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask)
+
+        x = x + self.cross_attn(
+            self.norm3(x),
+            context,
+            mllm_embeddings=mllm_embeddings,
+            mllm_mask=mllm_mask,
+            mllm_block_mask=mllm_block_mask,
+        )
+
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
+
 
 
 class MLP(torch.nn.Module):
@@ -377,6 +396,7 @@ class WanModel(torch.nn.Module):
         self.freq_dim = freq_dim
         self.has_image_input = has_image_input
         self.patch_size = patch_size
+        self.num_heads = num_heads
         self.seperated_timestep = seperated_timestep
         self.require_vae_embedding = require_vae_embedding
         self.require_clip_embedding = require_clip_embedding
@@ -456,12 +476,34 @@ class WanModel(torch.nn.Module):
             clip_embdding = self.img_emb(clip_feature)
             context = torch.cat([clip_embdding, context], dim=1)
         
+        mllm_embeddings = None
         # Process MLLM hidden states to MLLM embeddings (outer layer responsibility)
         if self.has_mllm_input and mllm_hidden_states is not None:
             # Expect mllm_hidden_states shape (B, L, Hdim)
             mllm_embeddings = self.mllm_embedding(mllm_hidden_states)
-        else:
-            mllm_embeddings = None
+
+        mllm_block_mask = None
+        if (
+            USE_FLEX_ATTENTION
+            and create_block_mask is not None
+            and self.has_mllm_input
+            and (mllm_embeddings is not None)
+            and (mllm_mask is not None)
+        ):
+            allowed = mllm_mask.to(device=x.device, dtype=torch.bool).contiguous()  # (B, Q, KV)
+            B, Q_LEN, KV_LEN = allowed.shape
+            
+            def mask_mod(b, h, q_idx, kv_idx):
+                return allowed[b, q_idx, kv_idx]
+
+            mllm_block_mask = create_block_mask(
+                mask_mod,
+                B=B,
+                H=self.num_heads,               
+                Q_LEN=Q_LEN,
+                KV_LEN=KV_LEN,
+                device=str(x.device),
+            )
 
         x, (f, h, w) = self.patchify(x)
         
@@ -482,17 +524,22 @@ class WanModel(torch.nn.Module):
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs, mllm_embeddings=mllm_embeddings, mllm_mask=mllm_mask)
+                x = block(
+                    x, context, t_mod, freqs,
+                    mllm_embeddings=mllm_embeddings,
+                    mllm_mask=mllm_mask,
+                    mllm_block_mask=mllm_block_mask,
+                )
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
