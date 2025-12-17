@@ -118,7 +118,6 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         if inputs is None:
             inputs = self.get_pipeline_inputs(data)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
-        print(inputs[1]['prompt'])
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         loss = self.task_to_loss[self.task](self.pipe, *inputs)

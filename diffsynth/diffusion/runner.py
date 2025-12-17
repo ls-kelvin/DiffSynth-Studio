@@ -61,11 +61,16 @@ def launch_data_process_task(
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=False, collate_fn=lambda x: x[0], num_workers=num_workers)
     model, dataloader = accelerator.prepare(model, dataloader)
     
+    os.makedirs(model_logger.output_path)
+    
     for data_id, data in enumerate(tqdm(dataloader)):
         with accelerator.accumulate(model):
             with torch.no_grad():
-                folder = os.path.join(model_logger.output_path, str(accelerator.process_index))
-                os.makedirs(folder, exist_ok=True)
-                save_path = os.path.join(model_logger.output_path, str(accelerator.process_index), f"{data_id}.pth")
+                # folder = os.path.join(model_logger.output_path, str(accelerator.process_index))
+                # os.makedirs(folder, exist_ok=True)
+                # save_path = os.path.join(model_logger.output_path, str(accelerator.process_index), f"{data_id}.pth")
+                save_path = os.path.join(model_logger.output_path, f"{data['video_id']}.pth")
+                if os.path.exists(save_path):
+                    continue
                 data = model(data)
                 torch.save(data, save_path)

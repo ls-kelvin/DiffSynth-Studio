@@ -91,6 +91,8 @@ class UnifiedDataset(torch.utils.data.Dataset):
             data = self.cached_data_operator(data)
         else:
             data = self.data[data_id % len(self.data)].copy()
+            if "video" in data:
+                data["video_id"] = data["video"].split("/")[-1].removesuffix(".mp4")
             for key in self.data_file_keys:
                 if key in data:
                     if key in self.special_operator_map:
