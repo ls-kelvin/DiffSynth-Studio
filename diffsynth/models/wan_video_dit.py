@@ -499,7 +499,7 @@ class WanModel(torch.nn.Module):
             mllm_block_mask = create_block_mask(
                 mask_mod,
                 B=B,
-                H=self.num_heads,               
+                H=None,               
                 Q_LEN=Q_LEN,
                 KV_LEN=KV_LEN,
                 device=str(x.device),

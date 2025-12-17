@@ -1442,7 +1442,7 @@ def model_fn_wan_video(
         mllm_block_mask = flex_create_block_mask(
             mask_mod,
             B=B,
-            H=dit.num_heads,
+            H=None,
             Q_LEN=Q_LEN,
             KV_LEN=KV_LEN,
             device=str(x.device),

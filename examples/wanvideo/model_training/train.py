@@ -6,6 +6,28 @@ from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
+def print_trainable_params(model):
+    """Print total trainable parameters and LoRA parameters."""
+    trainable_params = 0
+    lora_params = 0
+    all_params = 0
+    
+    for name, param in model.named_parameters():
+        all_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+            if "lora" in name.lower():
+                lora_params += param.numel()
+    
+    print(f"\n{'='*60}")
+    print(f"Parameter Count Summary:")
+    print(f"  Total Parameters:     {all_params:,}")
+    print(f"  Trainable Parameters: {trainable_params:,}")
+    print(f"  LoRA Parameters:      {lora_params:,}")
+    print(f"  LoRA / Trainable:     {lora_params / trainable_params * 100:.2f}%" if trainable_params > 0 else "  LoRA / Trainable:     N/A")
+    print(f"{'='*60}\n")
+
+
 class WanTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
@@ -170,6 +192,7 @@ if __name__ == "__main__":
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
     )
+    print_trainable_params(model)
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
