@@ -191,9 +191,28 @@ if __name__ == "__main__":
         mllm_processor_path=args.mllm_processor_path,  # 新增参数
     )
     print_trainable_params(model)
+    
+    # Prepare wandb config
+    wandb_config = {
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "num_epochs": args.num_epochs,
+        "batch_size": args.gradient_accumulation_steps,
+        "lora_rank": args.lora_rank,
+        "lora_target_modules": args.lora_target_modules,
+        "height": args.height,
+        "width": args.width,
+        "num_frames": args.num_frames,
+        "task": args.task,
+    } if args.use_wandb else None
+    
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_config=wandb_config,
     )
     launcher_map = {
         "sft:data_process": launch_data_process_task,

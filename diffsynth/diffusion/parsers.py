@@ -45,6 +45,12 @@ def add_output_config(parser: argparse.ArgumentParser):
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     return parser
 
+def add_wandb_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--use_wandb", default=False, action="store_true", help="Whether to use Weights & Biases for logging.")
+    parser.add_argument("--wandb_project", type=str, default="diffsynth-wanvideo", help="Weights & Biases project name.")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name. If None, a name will be auto-generated.")
+    return parser
+
 def add_lora_config(parser: argparse.ArgumentParser):
     parser.add_argument("--lora_base_model", type=str, default=None, help="Which model LoRA is added to.")
     parser.add_argument("--lora_target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2", help="Which layers LoRA is added to.")
@@ -67,4 +73,5 @@ def add_general_config(parser: argparse.ArgumentParser):
     parser = add_output_config(parser)
     parser = add_lora_config(parser)
     parser = add_gradient_config(parser)
+    parser = add_wandb_config(parser)
     return parser
