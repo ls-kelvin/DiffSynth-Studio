@@ -6,6 +6,7 @@ def add_dataset_base_config(parser: argparse.ArgumentParser):
     parser.add_argument("--dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the dataset.")
     parser.add_argument("--dataset_repeat", type=int, default=1, help="Number of times to repeat the dataset per epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
+    parser.add_argument("--dataloader_seed", type=int, default=None, help="Seed for dataloader shuffling. If None, a random seed will be generated and stored in checkpoints.")
     parser.add_argument("--data_file_keys", type=str, default="image,video", help="Data file keys in the metadata. Comma-separated.")
     return parser
 
@@ -45,6 +46,11 @@ def add_output_config(parser: argparse.ArgumentParser):
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     return parser
 
+def add_resume_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint directory saved during training to resume from.")
+    parser.add_argument("--resume_allow_incomplete_state", default=False, action="store_true", help="Continue training even if scheduler/optimizer states are missing when resuming.")
+    return parser
+
 def add_wandb_config(parser: argparse.ArgumentParser):
     parser.add_argument("--use_wandb", default=False, action="store_true", help="Whether to use Weights & Biases for logging.")
     parser.add_argument("--wandb_project", type=str, default="diffsynth-wanvideo", help="Weights & Biases project name.")
@@ -71,6 +77,7 @@ def add_general_config(parser: argparse.ArgumentParser):
     parser = add_model_config(parser)
     parser = add_training_config(parser)
     parser = add_output_config(parser)
+    parser = add_resume_config(parser)
     parser = add_lora_config(parser)
     parser = add_gradient_config(parser)
     parser = add_wandb_config(parser)

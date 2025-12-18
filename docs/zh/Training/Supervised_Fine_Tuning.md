@@ -127,3 +127,13 @@ if __name__ == "__main__":
 ```
 accelerate launch examples/qwen_image/model_training/special/simple/train.py
 ```
+
+### 恢复训练
+
+训练过程中可用 `save_steps` 或按 epoch 保存的检查点中包含模型权重、优化器、调度器以及 RNG 状态，便于继续训练。使用时只需在启动命令里指定：
+
+```
+accelerate launch examples/qwen_image/model_training/special/simple/train.py --resume_from_checkpoint path/to/checkpoint_dir
+```
+
+如需在缺少部分优化器/调度器状态时强制继续，可附加 `--resume_allow_incomplete_state`。

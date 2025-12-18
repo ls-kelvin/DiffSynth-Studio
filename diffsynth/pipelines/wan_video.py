@@ -437,8 +437,8 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
             seperate_cfg=True,
-            input_params_posi={"prompt": "prompt"},
-            input_params_nega={"prompt": "negative_prompt"},
+            input_params_posi={"prompt": "prompt", "positive": "positive"},
+            input_params_nega={"prompt": "negative_prompt", "positive": "positive"},
             input_params=("input_video", "context", "height", "width", "num_frames", "use_mllm_condition"),
             output_params=("mllm_hidden_states", "mllm_mask", "mllm_kv_len"),
             onload_model_names=("mllm_encoder",)
@@ -1427,14 +1427,6 @@ def model_fn_wan_video(
         dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-
-    # Decode compact prefix-length mask (1, Q) to full bool mask (1, Q, KV) right before DiT
-    if mllm_mask is not None and mllm_mask.dim() == 2:
-        lengths = mllm_mask.to(device=x.device, dtype=torch.int32).contiguous()
-        kv_len = int(lengths.max().item() if mllm_kv_len is None else mllm_kv_len)
-        kv_idx = torch.arange(kv_len, device=x.device)
-        allowed = kv_idx.view(1, 1, kv_len) < lengths.unsqueeze(-1)  # (B=1, Q, KV)
-        mllm_mask = allowed
     
     # Build flex block_mask once (if flex available)
     mllm_block_mask = None
@@ -1444,11 +1436,11 @@ def model_fn_wan_video(
         and mllm_embeddings is not None
         and mllm_mask is not None
     ):
-        allowed = mllm_mask.to(device=x.device, dtype=torch.bool).contiguous()  # (B, Q, KV)
-        B, Q_LEN, KV_LEN = allowed.shape
+        B, Q_LEN = mllm_mask.shape
+        KV_LEN = mllm_kv_len
 
         def mask_mod(b, h, q_idx, kv_idx):
-            return allowed[b, q_idx, kv_idx]
+            return kv_idx < mllm_mask[b, q_idx]
 
         mllm_block_mask = flex_create_block_mask(
             mask_mod,
