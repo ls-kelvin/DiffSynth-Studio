@@ -64,7 +64,7 @@ def launch_data_process_task(
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=False, collate_fn=lambda x: x[0], num_workers=num_workers)
     model, dataloader = accelerator.prepare(model, dataloader)
     
-    os.makedirs(model_logger.output_path)
+    os.makedirs(model_logger.output_path, exist_ok=True)
     
     for data_id, data in enumerate(tqdm(dataloader)):
         with accelerator.accumulate(model):
