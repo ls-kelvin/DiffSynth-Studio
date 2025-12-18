@@ -34,7 +34,8 @@ def launch_training_task(
     model_logger.init_wandb(accelerator)
     
     for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader):
+        pbar = tqdm(dataloader, ncols=80, dynamic_ncols=False)
+        for data in pbar:
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 if dataset.load_from_cache:
@@ -45,6 +46,9 @@ def launch_training_task(
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
                 scheduler.step()
+                # show loss on tqdm (no try/except as requested)
+                loss_val = loss.item() if isinstance(loss, torch.Tensor) else float(loss)
+                pbar.set_postfix({"loss": f"{loss_val:.6f}"})
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, save_steps)

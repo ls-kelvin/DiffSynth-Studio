@@ -546,7 +546,7 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
             
             prefix_lengths[:, start_dit:end_dit] = min(end_mllm, mllm_seq_len)
         
-        return prefix_lengths
+        return prefix_lengths, mllm_seq_len
 
     def process(self, pipe: WanVideoPipeline, prompt, input_video, context, height, width, num_frames, use_mllm_condition=False):
         if not use_mllm_condition:
@@ -554,11 +554,11 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         pipe.load_models_to_device(self.onload_model_names)
         mllm_video, video_metadata = self.process_video_for_mllm(pipe, input_video)
         mllm_hidden_states, input_ids = self.encode_prompt(pipe, prompt, mllm_video, video_metadata)
-        mllm_mask = self.calculate_mllm_mask(pipe, num_frames, height, width, mllm_hidden_states, input_ids)
+        mllm_mask, mllm_kv_len = self.calculate_mllm_mask(pipe, num_frames, height, width, mllm_hidden_states, input_ids)
         return {
             "mllm_hidden_states": mllm_hidden_states,
             "mllm_mask": mllm_mask,
-            "mllm_kv_len": mllm_seq_len,
+            "mllm_kv_len": mllm_kv_len
         }
 
 
