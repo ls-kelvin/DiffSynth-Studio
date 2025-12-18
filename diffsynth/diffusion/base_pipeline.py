@@ -430,8 +430,8 @@ class PipelineUnitRunner:
                         processor_inputs[name] = inputs_shared.get(name)
                 processor_outputs = unit.process(pipe, **processor_inputs)
                 inputs_nega.update(processor_outputs)
-            else:
-                inputs_nega.update(processor_outputs)
+            # else:
+            #     inputs_nega.update(processor_outputs)
         else:
             processor_inputs = {name: inputs_shared.get(name) for name in unit.input_params}
             processor_outputs = unit.process(pipe, **processor_inputs)

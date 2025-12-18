@@ -440,7 +440,7 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
             input_params_posi={"prompt": "prompt"},
             input_params_nega={"prompt": "negative_prompt"},
             input_params=("input_video", "context", "height", "width", "num_frames", "use_mllm_condition"),
-            output_params=("mllm_hidden_states", "mllm_mask"),
+            output_params=("mllm_hidden_states", "mllm_mask", "mllm_kv_len"),
             onload_model_names=("mllm_encoder",)
         )
     
@@ -485,7 +485,8 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
             input_ids: Token IDs from processor to find vision token positions
             
         Returns:
-            mask: Boolean tensor of shape (num_dit_tokens, mllm_seq_len) where True means can attend
+            prefix_lengths: Int tensor of shape (1, num_dit_tokens) where each entry is the
+            exclusive upper bound (in KV positions) the DiT token can attend to.
         """
         # Calculate spatial dimensions: VAE factor 8 * patch size 2 = 16
         lat_h = height // 16
@@ -505,8 +506,7 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         vision_start_positions = (input_ids[0] == vision_start_token_id).nonzero(as_tuple=True)[0]
         vision_end_positions = (input_ids[0] == vision_end_token_id).nonzero(as_tuple=True)[0]
         
-        # Create mask: (num_dit_tokens, mllm_seq_len)
-        mask = torch.zeros((num_dit_tokens, mllm_seq_len), device=mllm_hidden_states.device, dtype=torch.bool)
+        prefix_lengths = torch.zeros((1, num_dit_tokens), device=mllm_hidden_states.device, dtype=torch.int32)
         
         # Find text end: position before the first vision_start token
         if len(vision_start_positions) > 0:
@@ -516,13 +516,13 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
             text_end = mllm_seq_len
         
         # Frame 0 (first S_dit tokens): can only attend to text
-        mask[:S_dit, :text_end] = True
+        prefix_lengths[:, :S_dit] = min(text_end, mllm_seq_len)
         
         # Frame block 1 (4 latent frames = frames 1-16): also only text, no video condition
         # According to instruction: "dit first generate the first latent frame which correspond to frame 0,
         # then generate the next block of 4 latent frames, which correspond to video frames 1-16 with no mllm video condition"
         if num_dit_frames > 1:
-            mask[S_dit:5*S_dit, :text_end] = True
+            prefix_lengths[:, S_dit:5*S_dit] = min(text_end, mllm_seq_len)
         
         # For subsequent DiT blocks (i >= 5), they can attend to text + video up to their time
         # Each block of 4 latent frames corresponds to 1 second of video
@@ -544,12 +544,9 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
                 # Can see all available MLLM tokens
                 end_mllm = mllm_seq_len
             
-            mask[start_dit:end_dit, :end_mllm] = True
+            prefix_lengths[:, start_dit:end_dit] = min(end_mllm, mllm_seq_len)
         
-        # Add batch dimension
-        mask = mask.unsqueeze(0)  # (1, num_dit_tokens, mllm_seq_len)
-        
-        return mask
+        return prefix_lengths
 
     def process(self, pipe: WanVideoPipeline, prompt, input_video, context, height, width, num_frames, use_mllm_condition=False):
         if not use_mllm_condition:
@@ -558,7 +555,11 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         mllm_video, video_metadata = self.process_video_for_mllm(pipe, input_video)
         mllm_hidden_states, input_ids = self.encode_prompt(pipe, prompt, mllm_video, video_metadata)
         mllm_mask = self.calculate_mllm_mask(pipe, num_frames, height, width, mllm_hidden_states, input_ids)
-        return {"mllm_hidden_states": mllm_hidden_states, "mllm_mask": mllm_mask}
+        return {
+            "mllm_hidden_states": mllm_hidden_states,
+            "mllm_mask": mllm_mask,
+            "mllm_kv_len": mllm_seq_len,
+        }
 
 
 
@@ -1274,6 +1275,7 @@ def model_fn_wan_video(
     context: torch.Tensor = None,
     mllm_hidden_states: torch.Tensor = None,
     mllm_mask: torch.Tensor = None,
+    mllm_kv_len: int = None,
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
     reference_latents = None,
@@ -1426,6 +1428,15 @@ def model_fn_wan_video(
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
+    # Decode compact prefix-length mask (1, Q) to full bool mask (1, Q, KV) right before DiT
+    if mllm_mask is not None and mllm_mask.dim() == 2:
+        lengths = mllm_mask.to(device=x.device, dtype=torch.int32).contiguous()
+        kv_len = int(lengths.max().item() if mllm_kv_len is None else mllm_kv_len)
+        kv_idx = torch.arange(kv_len, device=x.device)
+        allowed = kv_idx.view(1, 1, kv_len) < lengths.unsqueeze(-1)  # (B=1, Q, KV)
+        mllm_mask = allowed
+    
+    # Build flex block_mask once (if flex available)
     mllm_block_mask = None
     if (
         FLEX_ATTENTION_AVAILABLE
@@ -1433,7 +1444,7 @@ def model_fn_wan_video(
         and mllm_embeddings is not None
         and mllm_mask is not None
     ):
-        allowed = mllm_mask.to(device=x.device, dtype=torch.bool).contiguous()
+        allowed = mllm_mask.to(device=x.device, dtype=torch.bool).contiguous()  # (B, Q, KV)
         B, Q_LEN, KV_LEN = allowed.shape
 
         def mask_mod(b, h, q_idx, kv_idx):
