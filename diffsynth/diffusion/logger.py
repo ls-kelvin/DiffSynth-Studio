@@ -1,4 +1,4 @@
-import json, os, torch
+import os, json, torch
 from accelerate import Accelerator
 
 
@@ -10,6 +10,8 @@ class ModelLogger:
         self.num_steps = 0
         self.use_wandb = use_wandb
         self.wandb_initialized = False
+        self.dataloader_seed = None  # Will be set by runner for checkpoint reproducibility
+        self.current_epoch = 0
         
         if self.use_wandb:
             try:
@@ -32,79 +34,39 @@ class ModelLogger:
                 config=self.wandb_config,
             )
             self.wandb_initialized = True
-
-    @staticmethod
-    def _normalize_checkpoint_path(checkpoint_path: str):
-        if checkpoint_path is None:
-            return None
-        if os.path.isfile(checkpoint_path) and checkpoint_path.endswith(".safetensors"):
-            checkpoint_path = checkpoint_path.replace(".safetensors", "")
-        return checkpoint_path
-
-    def read_checkpoint_metadata(self, checkpoint_path: str):
-        """Lightweight helper to read checkpoint meta.json without loading weights."""
-        checkpoint_path = self._normalize_checkpoint_path(checkpoint_path)
-        if checkpoint_path is None:
-            return {}
-        meta_path = os.path.join(checkpoint_path, "meta.json")
-        if not os.path.exists(meta_path):
-            return {}
-        with open(meta_path, "r") as f:
-            return json.load(f)
     
     def log_metrics(self, metrics: dict):
         """Log metrics to wandb"""
         if self.use_wandb and self.wandb_initialized:
             self.wandb.log(metrics, step=self.num_steps)
 
-    def on_step_end(self, accelerator: Accelerator, model: torch.nn.Module, optimizer=None, scheduler=None, save_steps=None, loss=None, epoch_id=None, step_in_epoch=None, steps_per_epoch=None, dataloader_seed=None):
+    def on_step_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None, loss=None, epoch=0):
         self.num_steps += 1
+        self.current_epoch = epoch
         
         # Log loss to wandb
         if loss is not None and accelerator.is_main_process:
             self.log_metrics({"train/loss": loss.item() if isinstance(loss, torch.Tensor) else loss})
         
         if save_steps is not None and self.num_steps % save_steps == 0:
-            checkpoint_name = f"step-{self.num_steps}"
-            self.save_checkpoint(
-                accelerator,
-                model,
-                checkpoint_name,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                metadata={"epoch": epoch_id, "step_in_epoch": step_in_epoch, "steps_per_epoch": steps_per_epoch, "dataloader_seed": dataloader_seed},
-            )
+            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+            self.save_checkpoint(accelerator, epoch=epoch)
 
 
-    def on_epoch_end(self, accelerator: Accelerator, model: torch.nn.Module, optimizer=None, scheduler=None, epoch_id=None, steps_per_epoch=None, dataloader_seed=None):
-        checkpoint_name = f"epoch-{epoch_id}"
-        metadata = {
-            "epoch": epoch_id,
-            "step_in_epoch": (steps_per_epoch - 1) if steps_per_epoch is not None else None,
-            "steps_per_epoch": steps_per_epoch,
-            "dataloader_seed": dataloader_seed,
-        }
-        self.save_checkpoint(
-            accelerator,
-            model,
-            checkpoint_name,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            metadata=metadata,
-        )
+    def on_epoch_end(self, accelerator: Accelerator, model: torch.nn.Module, epoch_id):
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            state_dict = accelerator.get_state_dict(model)
+            state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+            state_dict = self.state_dict_converter(state_dict)
+            os.makedirs(self.output_path, exist_ok=True)
+            path = os.path.join(self.output_path, f"epoch-{epoch_id}.safetensors")
+            accelerator.save(state_dict, path, safe_serialization=True)
 
 
-    def on_training_end(self, accelerator: Accelerator, model: torch.nn.Module, optimizer=None, scheduler=None, save_steps=None, epoch_id=None, step_in_epoch=None, steps_per_epoch=None, dataloader_seed=None):
+    def on_training_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None):
         if save_steps is not None and self.num_steps % save_steps != 0:
-            checkpoint_name = f"step-{self.num_steps}"
-            self.save_checkpoint(
-                accelerator,
-                model,
-                checkpoint_name,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                metadata={"epoch": epoch_id, "step_in_epoch": step_in_epoch, "steps_per_epoch": steps_per_epoch, "dataloader_seed": dataloader_seed},
-            )
+            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
         
         # Finish wandb run
         if self.use_wandb and self.wandb_initialized:
@@ -122,52 +84,23 @@ class ModelLogger:
             accelerator.save(state_dict, path, safe_serialization=True)
 
 
-    def save_training_state(self, accelerator: Accelerator, checkpoint_name: str, metadata=None):
-        """Save optimizer/scheduler/rng states for resuming training."""
-        checkpoint_dir = os.path.join(self.output_path, checkpoint_name)
-        accelerator.wait_for_everyone()
+    def save_checkpoint(self, accelerator: Accelerator, epoch: int = 0):
+        """
+        Save a checkpoint for resuming training.
+        Uses accelerator.save_state() to save model, optimizer, scheduler, and dataloader states.
+        Also saves training metadata (epoch, step, dataloader_seed).
+        """
+        checkpoint_dir = os.path.join(self.output_path, f"checkpoint-{self.num_steps}")
+        accelerator.save_state(checkpoint_dir)
+        
+        # Save training metadata (only on main process)
         if accelerator.is_main_process:
-            os.makedirs(checkpoint_dir, exist_ok=True)
-        try:
-            accelerator.save_state(checkpoint_dir, safe_serialization=True)
-        except TypeError:
-            accelerator.save_state(checkpoint_dir)
-        if accelerator.is_main_process:
-            metadata = {} if metadata is None else dict(metadata)
-            metadata.setdefault("step", self.num_steps)
-            metadata.setdefault("checkpoint_name", checkpoint_name)
-            meta_path = os.path.join(checkpoint_dir, "meta.json")
-            with open(meta_path, "w") as f:
+            metadata = {
+                "epoch": epoch,
+                "global_step": self.num_steps,
+                "dataloader_seed": self.dataloader_seed,
+            }
+            metadata_path = os.path.join(checkpoint_dir, "training_metadata.json")
+            with open(metadata_path, "w") as f:
                 json.dump(metadata, f, indent=2)
-        accelerator.wait_for_everyone()
-        return checkpoint_dir
-
-
-    def save_checkpoint(self, accelerator: Accelerator, model: torch.nn.Module, checkpoint_name: str, optimizer=None, scheduler=None, metadata=None):
-        """Save both lightweight trainable weights and full training state."""
-        self.save_model(accelerator, model, f"{checkpoint_name}.safetensors")
-        if optimizer is not None or scheduler is not None:
-            self.save_training_state(accelerator, checkpoint_name, metadata=metadata)
-
-
-    def load_training_state(self, accelerator: Accelerator, checkpoint_path: str, allow_incomplete_state: bool = False):
-        """Load model/optimizer/scheduler/rng states for resuming training."""
-        if checkpoint_path is None:
-            return {}
-        checkpoint_path = self._normalize_checkpoint_path(checkpoint_path)
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process and not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint path not found: {checkpoint_path}")
-        accelerator.wait_for_everyone()
-        try:
-            accelerator.load_state(checkpoint_path, strict=not allow_incomplete_state)
-        except TypeError:
-            accelerator.load_state(checkpoint_path)
-
-        metadata = self.read_checkpoint_metadata(checkpoint_path)
-        gathered = accelerator.gather_object(metadata)
-        metadata = next((m for m in gathered if m is not None), {})
-        metadata = metadata or {}
-        if "step" in metadata:
-            self.num_steps = metadata["step"]
-        return metadata
+            accelerator.print(f"Checkpoint saved to {checkpoint_dir}")

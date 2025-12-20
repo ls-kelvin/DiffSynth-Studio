@@ -127,3 +127,51 @@ Assembling all the above code results in `examples/qwen_image/model_training/spe
 ```
 accelerate launch examples/qwen_image/model_training/special/simple/train.py
 ```
+
+## Resuming Training from Checkpoints
+
+The training framework supports resuming training from checkpoints. When using `save_steps`, the framework automatically saves complete training states (including model weights, optimizer states, scheduler states, and dataloader states) that can be used to resume training later.
+
+### Checkpoint Saving
+
+When `save_steps` is set, the framework saves two types of files for each checkpoint:
+1. **Model weights** (`step-{N}.safetensors`): The trainable parameters (e.g., LoRA weights)
+2. **Full checkpoint** (`checkpoint-{N}/`): Contains complete training state for resuming
+
+The checkpoint directory includes:
+- `pytorch_model.bin` or `.safetensors`: Model state dict
+- `optimizer.bin`: Optimizer state dict
+- `scheduler.bin`: Learning rate scheduler state
+- `random_states_*.pkl`: Random number generator states for reproducibility
+- `training_metadata.json`: Training progress metadata (epoch, step, dataloader_seed)
+
+### Resuming Training
+
+To resume training from a checkpoint, use the `--resume_from_checkpoint` argument:
+
+```bash
+accelerate launch examples/wanvideo/model_training/train.py \
+    --resume_from_checkpoint models/my_output/checkpoint-1000 \
+    ... # other arguments
+```
+
+The framework will:
+1. Load all training states (model, optimizer, scheduler)
+2. Restore the training progress (epoch, global step)
+3. Skip already-completed steps in the current epoch
+
+### Handling Incomplete Checkpoints
+
+If a checkpoint is incomplete (e.g., only model weights were saved), you can use `--resume_allow_incomplete_state` to continue training:
+
+```bash
+accelerate launch examples/wanvideo/model_training/train.py \
+    --resume_from_checkpoint models/my_output/checkpoint-1000 \
+    --resume_allow_incomplete_state \
+    ... # other arguments
+```
+
+This is useful when:
+- Resuming from checkpoints saved by older versions of the framework
+- Loading only model weights without optimizer/scheduler states
+- Testing or debugging training with partial state restoration

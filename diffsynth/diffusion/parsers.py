@@ -38,17 +38,13 @@ def add_training_config(parser: argparse.ArgumentParser):
     parser.add_argument("--find_unused_parameters", default=False, action="store_true", help="Whether to find unused parameters in DDP.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--task", type=str, default="sft", required=False, help="Task type.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint directory saved during training to resume from.")
     return parser
 
 def add_output_config(parser: argparse.ArgumentParser):
     parser.add_argument("--output_path", type=str, default="./models", help="Output save path.")
     parser.add_argument("--remove_prefix_in_ckpt", type=str, default="pipe.dit.", help="Remove prefix in ckpt.")
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
-    return parser
-
-def add_resume_config(parser: argparse.ArgumentParser):
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint directory saved during training to resume from.")
-    parser.add_argument("--resume_allow_incomplete_state", default=False, action="store_true", help="Continue training even if scheduler/optimizer states are missing when resuming.")
     return parser
 
 def add_wandb_config(parser: argparse.ArgumentParser):
@@ -77,7 +73,6 @@ def add_general_config(parser: argparse.ArgumentParser):
     parser = add_model_config(parser)
     parser = add_training_config(parser)
     parser = add_output_config(parser)
-    parser = add_resume_config(parser)
     parser = add_lora_config(parser)
     parser = add_gradient_config(parser)
     parser = add_wandb_config(parser)

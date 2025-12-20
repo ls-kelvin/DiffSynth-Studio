@@ -128,12 +128,50 @@ if __name__ == "__main__":
 accelerate launch examples/qwen_image/model_training/special/simple/train.py
 ```
 
+## 从检查点恢复训练
+
+训练框架支持从检查点恢复训练。当使用 `save_steps` 时，框架会自动保存完整的训练状态（包括模型权重、优化器状态、调度器状态和数据加载器状态），可用于稍后恢复训练。
+
+### 检查点保存
+
+当设置 `save_steps` 时，框架会为每个检查点保存两类文件：
+1. **模型权重** (`step-{N}.safetensors`)：可训练参数（如 LoRA 权重）
+2. **完整检查点** (`checkpoint-{N}/`)：包含用于恢复训练的完整状态
+
+检查点目录包含：
+- `pytorch_model.bin` 或 `.safetensors`：模型状态字典
+- `optimizer.bin`：优化器状态字典
+- `scheduler.bin`：学习率调度器状态
+- `random_states_*.pkl`：用于可复现性的随机数生成器状态
+- `training_metadata.json`：训练进度元数据（epoch、step、dataloader_seed）
+
 ### 恢复训练
 
-训练过程中可用 `save_steps` 或按 epoch 保存的检查点中包含模型权重、优化器、调度器以及 RNG 状态，便于继续训练。使用时只需在启动命令里指定：
+要从检查点恢复训练，使用 `--resume_from_checkpoint` 参数：
 
-```
-accelerate launch examples/qwen_image/model_training/special/simple/train.py --resume_from_checkpoint path/to/checkpoint_dir
+```bash
+accelerate launch examples/wanvideo/model_training/train.py \
+    --resume_from_checkpoint models/my_output/checkpoint-1000 \
+    ... # 其他参数
 ```
 
-如需在缺少部分优化器/调度器状态时强制继续，可附加 `--resume_allow_incomplete_state`。
+框架将：
+1. 加载所有训练状态（模型、优化器、调度器）
+2. 恢复训练进度（epoch、全局步数）
+3. 跳过当前 epoch 中已完成的步骤
+
+### 处理不完整的检查点
+
+如果检查点不完整（例如只保存了模型权重），可以使用 `--resume_allow_incomplete_state` 继续训练：
+
+```bash
+accelerate launch examples/wanvideo/model_training/train.py \
+    --resume_from_checkpoint models/my_output/checkpoint-1000 \
+    --resume_allow_incomplete_state \
+    ... # 其他参数
+```
+
+这在以下情况很有用：
+- 从旧版本框架保存的检查点恢复
+- 仅加载模型权重而不加载优化器/调度器状态
+- 使用部分状态恢复进行测试或调试训练

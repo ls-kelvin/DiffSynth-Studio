@@ -1,4 +1,4 @@
-import os, re, torch
+import os, json, torch
 from tqdm import tqdm
 from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
@@ -23,6 +23,20 @@ def prune_cached_data(data):
     return data
 
 
+def _get_dataloader_seed(args, accelerator):
+    """Get or generate a seed for dataloader shuffling."""
+    import random
+    if args is not None and hasattr(args, 'dataloader_seed') and args.dataloader_seed is not None:
+        return args.dataloader_seed
+    # Generate a random seed and sync across all processes
+    if accelerator.is_main_process:
+        seed = random.randint(0, 2**32 - 1)
+    else:
+        seed = 0
+    seed = accelerator.gather(torch.tensor([seed], device=accelerator.device))[0].item()
+    return int(seed)
+
+
 def launch_training_task(
     accelerator: Accelerator,
     dataset: torch.utils.data.Dataset,
@@ -41,73 +55,65 @@ def launch_training_task(
         num_workers = args.dataset_num_workers
         save_steps = args.save_steps
         num_epochs = args.num_epochs
-        resume_from_checkpoint = getattr(args, "resume_from_checkpoint", None)
-        allow_incomplete_state = getattr(args, "resume_allow_incomplete_state", False)
-        dataloader_seed = getattr(args, "dataloader_seed", None)
-    else:
-        resume_from_checkpoint = None
-        allow_incomplete_state = False
-        dataloader_seed = None
-
-    # Prepare dataloader RNG/state for deterministic resume
-    resume_metadata = {}
-    if resume_from_checkpoint is not None:
-        resume_metadata = model_logger.read_checkpoint_metadata(resume_from_checkpoint)
-
-    # Generate / synchronize dataloader seed across ranks
-    if dataloader_seed is None:
-        dataloader_seed = resume_metadata.get("dataloader_seed", torch.seed())
-    dataloader_seed_tensor = torch.tensor([int(dataloader_seed)], device="cpu", dtype=torch.int64)
-    dataloader_seed = int(accelerator.broadcast(dataloader_seed_tensor)[0].item())
     
-    dataloader_generator = torch.Generator(device="cpu")
-    if dataloader_seed is not None:
-        dataloader_generator.manual_seed(int(dataloader_seed))
-
+    # Get resume parameters
+    resume_from_checkpoint = getattr(args, 'resume_from_checkpoint', None) if args is not None else None
+    resume_allow_incomplete_state = getattr(args, 'resume_allow_incomplete_state', False) if args is not None else False
+    
+    # Get dataloader seed for reproducibility
+    dataloader_seed = _get_dataloader_seed(args, accelerator)
+    generator = torch.Generator()
+    generator.manual_seed(dataloader_seed)
+    
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
-    sampler = torch.utils.data.RandomSampler(dataset, generator=dataloader_generator)
-    dataloader = torch.utils.data.DataLoader(dataset, sampler=sampler, collate_fn=lambda x: x[0], num_workers=num_workers)
+    dataloader = torch.utils.data.DataLoader(
+        dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers, generator=generator
+    )
     
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    
+    # Resume from checkpoint if specified
+    starting_epoch = 0
+    resume_step = 0
+    if resume_from_checkpoint is not None:
+        if os.path.isdir(resume_from_checkpoint):
+            accelerator.print(f"Resuming from checkpoint: {resume_from_checkpoint}")
+            accelerator.load_state(resume_from_checkpoint)
+            
+            # Load training metadata
+            metadata_path = os.path.join(resume_from_checkpoint, "training_metadata.json")
+            if os.path.exists(metadata_path):
+                with open(metadata_path, "r") as f:
+                    metadata = json.load(f)
+                starting_epoch = metadata.get("epoch", 0)
+                resume_step = metadata.get("global_step", 0)
+                model_logger.num_steps = resume_step
+                accelerator.print(f"Resuming from epoch {starting_epoch}, step {resume_step}")
+        else:
+            accelerator.print(f"Warning: Checkpoint path {resume_from_checkpoint} does not exist, starting from scratch")
+    
+    # Store dataloader seed in model_logger for checkpoint saving
+    model_logger.dataloader_seed = dataloader_seed
     
     # Initialize wandb
     model_logger.init_wandb(accelerator)
     
-    steps_per_epoch = len(dataloader) if hasattr(dataloader, "__len__") else None
-    start_epoch = 0
-    resume_step_in_epoch = -1
-    if resume_from_checkpoint is not None:
-        resume_metadata = model_logger.load_training_state(
-            accelerator,
-            resume_from_checkpoint,
-            allow_incomplete_state=allow_incomplete_state,
-        )
-        start_epoch = int(resume_metadata.get("epoch", 0) or 0)
-        resume_step_in_epoch = resume_metadata.get("step_in_epoch", -1)
-        if resume_step_in_epoch is None:
-            resume_step_in_epoch = -1
+    # Skip dataloader to the correct position if resuming
+    skip_steps = resume_step - starting_epoch * len(dataloader)
+
+    for epoch_id in range(starting_epoch, num_epochs):
+        dataloader.set_epoch(epoch_id)
+
+        if epoch_id == starting_epoch:
+            dataloader_iter = accelerator.skip_first_batches(dataloader, num_batches=skip_steps)
         else:
-            resume_step_in_epoch = int(resume_step_in_epoch)
-        if "steps_per_epoch" in resume_metadata:
-            steps_per_epoch = int(resume_metadata["steps_per_epoch"])
-        if model_logger.num_steps == 0 and resume_from_checkpoint is not None:
-            ckpt_name = os.path.basename(resume_from_checkpoint.rstrip("/"))
-            match = re.search(r"step-(\d+)", ckpt_name)
-            if match:
-                model_logger.num_steps = int(match.group(1))
-        if steps_per_epoch is not None and resume_step_in_epoch >= steps_per_epoch - 1:
-            start_epoch = min(num_epochs, start_epoch + 1)
-            resume_step_in_epoch = -1
-    
-    last_trained_step_in_epoch = -1
-    last_epoch = start_epoch - 1
-    for epoch_id in range(start_epoch, num_epochs):
-        last_epoch = epoch_id
-        pbar = tqdm(dataloader, ncols=80, dynamic_ncols=False)
-        for step_in_epoch, data in enumerate(pbar):
-            if epoch_id == start_epoch and resume_step_in_epoch >= 0 and step_in_epoch <= resume_step_in_epoch:
-                continue
+            dataloader_iter = dataloader
+
+        pbar = tqdm(dataloader_iter, ncols=130, dynamic_ncols=False, 
+                   desc=f"Epoch {epoch_id + 1}/{num_epochs}")
+
+        for data in pbar:
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 if dataset.load_from_cache:
@@ -116,44 +122,14 @@ def launch_training_task(
                     loss = model(data)
                 accelerator.backward(loss)
                 optimizer.step()
-                model_logger.on_step_end(
-                    accelerator,
-                    model,
-                    optimizer,
-                    scheduler,
-                    save_steps,
-                    loss=loss,
-                    epoch_id=epoch_id,
-                    step_in_epoch=step_in_epoch,
-                    steps_per_epoch=steps_per_epoch,
-                    dataloader_seed=dataloader_seed,
-                )
+                model_logger.on_step_end(accelerator, model, save_steps, loss=loss, epoch=epoch_id)
                 scheduler.step()
-                last_trained_step_in_epoch = step_in_epoch
                 # show loss on tqdm (no try/except as requested)
                 loss_val = loss.item() if isinstance(loss, torch.Tensor) else float(loss)
                 pbar.set_postfix({"loss": f"{loss_val:.6f}"})
         if save_steps is None:
-            model_logger.on_epoch_end(
-                accelerator,
-                model,
-                optimizer,
-                scheduler,
-                epoch_id,
-                steps_per_epoch,
-                dataloader_seed=dataloader_seed,
-            )
-    model_logger.on_training_end(
-        accelerator,
-        model,
-        optimizer,
-        scheduler,
-        save_steps,
-        last_epoch,
-        last_trained_step_in_epoch,
-        steps_per_epoch,
-        dataloader_seed=dataloader_seed,
-    )
+            model_logger.on_epoch_end(accelerator, model, epoch_id)
+    model_logger.on_training_end(accelerator, model, save_steps)
 
 
 def launch_data_process_task(
@@ -172,7 +148,7 @@ def launch_data_process_task(
     
     os.makedirs(model_logger.output_path, exist_ok=True)
     
-    for data_id, data in enumerate(tqdm(dataloader)):
+    for data_id, data in enumerate(tqdm(dataloader, ncols=130, dynamic_ncols=False)):
         with accelerator.accumulate(model):
             with torch.no_grad():
                 # folder = os.path.join(model_logger.output_path, str(accelerator.process_index))
