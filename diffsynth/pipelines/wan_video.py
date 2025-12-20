@@ -30,11 +30,11 @@ from ..models.wan_video_mllm_encoder import WanMLLMEncoder
 from ..models.wan_video_mllm_encoder import Qwen3VLProcessor
 
 try:
-    from torch.nn.attention.flex_attention import create_block_mask as flex_create_block_mask
+    from torch.nn.attention.flex_attention import create_block_mask
     FLEX_ATTENTION_AVAILABLE = os.environ.get("DISABLE_FLEX_ATTENTION", "0") != "1"
 except ImportError:
     FLEX_ATTENTION_AVAILABLE = False
-    flex_create_block_mask = None
+    create_block_mask = None
 
 
 class WanVideoPipeline(BasePipeline):
@@ -235,6 +235,7 @@ class WanVideoPipeline(BasePipeline):
         width: Optional[int] = 832,
         num_frames=81,
         use_mllm_condition: Optional[bool] = False,
+        mllm_mode: Optional[Literal["text", "full"]] = "full",
         # Classifier-free guidance
         cfg_scale: Optional[float] = 5.0,
         cfg_merge: Optional[bool] = False,
@@ -265,12 +266,12 @@ class WanVideoPipeline(BasePipeline):
         
         # Inputs
         inputs_posi = {
-            "prompt": prompt,
+            "prompt": prompt, "mllm_mode": mllm_mode,
             "vap_prompt": vap_prompt,
             "tea_cache_l1_thresh": tea_cache_l1_thresh, "tea_cache_model_id": tea_cache_model_id, "num_inference_steps": num_inference_steps,
         }
         inputs_nega = {
-            "negative_prompt": negative_prompt,
+            "negative_prompt": negative_prompt, "mllm_mode": mllm_mode,
             "negative_vap_prompt": negative_vap_prompt,
             "tea_cache_l1_thresh": tea_cache_l1_thresh, "tea_cache_model_id": tea_cache_model_id, "num_inference_steps": num_inference_steps,
         }
@@ -437,8 +438,8 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
             seperate_cfg=True,
-            input_params_posi={"prompt": "prompt", "positive": "positive"},
-            input_params_nega={"prompt": "negative_prompt", "positive": "positive"},
+            input_params_posi={"prompt": "prompt", "mode": "mllm_mode"},
+            input_params_nega={"prompt": "negative_prompt", "mode": "mllm_mode"},
             input_params=("input_video", "context", "height", "width", "num_frames", "use_mllm_condition"),
             output_params=("mllm_hidden_states", "mllm_mask", "mllm_kv_len"),
             onload_model_names=("mllm_encoder",)
@@ -453,17 +454,23 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         input_video = [input_video[i] for i in indices]
         return input_video, video_metadata
         
-    def encode_prompt(self, pipe: WanVideoPipeline, prompt, input_video, video_metadata):
-        template = "<|im_start|>system\nAnalyze the provided context (either a text description for the first frame or a sequence of preceding video frames). Describe the key visual elements, ongoing motion, camera perspective, and overall scene composition. Then, based on the user's instruction, predict the visual content and dynamics of the next frame(s). Ensure the prediction maintains temporal coherence, logical progression, and consistency with the established style and action.<|im_end|>\n<|im_start|>user\n{}<|vision_start|><|video_pad|><|vision_end|>"
+    def encode_prompt(self, pipe: WanVideoPipeline, prompt, input_video, video_metadata, mode="full"):
+        template = "<|im_start|>system\nAnalyze the provided context (either a text description for the first frame or a sequence of preceding video frames). Describe the key visual elements, ongoing motion, camera perspective, and overall scene composition. Then, based on the user's instruction, predict the visual content and dynamics of the next frame(s). Ensure the prediction maintains temporal coherence, logical progression, and consistency with the established style and action.<|im_end|>\n<|im_start|>user\n{}"
         drop_idx = 87 # index of the begining of user instruction
-        txt = [template.format(prompt)]
+        if prompt == "" or prompt == " ":
+            prompt = "  "
+        txt = [template.format(prompt + "<|vision_start|><|video_pad|><|vision_end|>") if mode == "full" else template.format(prompt)]
         model_inputs = pipe.mllm_processor(text=txt, videos=input_video, padding=True, video_metadata=video_metadata, return_tensors="pt", do_resize=False, do_sample_frames=False).to(pipe.device)
         hidden_states = pipe.mllm_encoder(**model_inputs)[-1]
         hidden_states = hidden_states[:, drop_idx:]
+        input_ids = model_inputs["input_ids"][:, drop_idx:]
+        if hidden_states.shape[1] < 512:
+            pad_len = 512 - hidden_states.shape[1]
+            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, pad_len), value=0)
         # Return both hidden_states and input_ids for mask calculation
-        return hidden_states, model_inputs["input_ids"][:, drop_idx:]
+        return hidden_states, input_ids
     
-    def calculate_mllm_mask(self, pipe: WanVideoPipeline, num_frames, height, width, mllm_hidden_states, input_ids):
+    def calculate_mllm_mask(self, pipe: WanVideoPipeline, num_frames, height, width, input_ids):
         """
         Calculate the cross-attention mask for MLLM embeddings based on temporal causality.
         
@@ -497,7 +504,7 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         num_dit_frames = 1 + (num_frames - 1) // 4
         num_dit_tokens = num_dit_frames * S_dit
         
-        mllm_seq_len = mllm_hidden_states.shape[1]
+        mllm_seq_len = input_ids.shape[1]
         
         # Find vision_start and vision_end token positions
         vision_start_token_id = pipe.mllm_encoder.config.vision_start_token_id
@@ -506,7 +513,7 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         vision_start_positions = (input_ids[0] == vision_start_token_id).nonzero(as_tuple=True)[0]
         vision_end_positions = (input_ids[0] == vision_end_token_id).nonzero(as_tuple=True)[0]
         
-        prefix_lengths = torch.zeros((1, num_dit_tokens), device=mllm_hidden_states.device, dtype=torch.int32)
+        prefix_lengths = torch.zeros((1, num_dit_tokens), device=input_ids.device, dtype=torch.int32)
         
         # Find text end: position before the first vision_start token
         if len(vision_start_positions) > 0:
@@ -548,13 +555,16 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         
         return prefix_lengths, mllm_seq_len
 
-    def process(self, pipe: WanVideoPipeline, prompt, input_video, context, height, width, num_frames, use_mllm_condition=False):
+    def process(self, pipe: WanVideoPipeline, prompt, input_video, context, height, width, num_frames, use_mllm_condition=False, mode="full"):
         if not use_mllm_condition:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        mllm_video, video_metadata = self.process_video_for_mllm(pipe, input_video)
-        mllm_hidden_states, input_ids = self.encode_prompt(pipe, prompt, mllm_video, video_metadata)
-        mllm_mask, mllm_kv_len = self.calculate_mllm_mask(pipe, num_frames, height, width, mllm_hidden_states, input_ids)
+        if mode == "text":
+            mllm_hidden_states, input_ids = self.encode_prompt(pipe, prompt, None, None, mode="text")
+        else:
+            mllm_video, video_metadata = self.process_video_for_mllm(pipe, input_video)
+            mllm_hidden_states, input_ids = self.encode_prompt(pipe, prompt, mllm_video, video_metadata, mode="full")
+        mllm_mask, mllm_kv_len = self.calculate_mllm_mask(pipe, num_frames, height, width, input_ids)
         return {
             "mllm_hidden_states": mllm_hidden_states,
             "mllm_mask": mllm_mask,
@@ -1432,7 +1442,7 @@ def model_fn_wan_video(
     mllm_block_mask = None
     if (
         FLEX_ATTENTION_AVAILABLE
-        and flex_create_block_mask is not None
+        and create_block_mask is not None
         and mllm_embeddings is not None
         and mllm_mask is not None
     ):
@@ -1442,7 +1452,7 @@ def model_fn_wan_video(
         def mask_mod(b, h, q_idx, kv_idx):
             return kv_idx < mllm_mask[b, q_idx]
 
-        mllm_block_mask = flex_create_block_mask(
+        mllm_block_mask = create_block_mask(
             mask_mod,
             B=B,
             H=None,

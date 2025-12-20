@@ -10,11 +10,8 @@ try:
     import os
     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
     
-    if os.environ.get("DISABLE_FLEX_ATTENTION", "0") == "1":
-        USE_FLEX_ATTENTION = False
-    else:
-        USE_FLEX_ATTENTION = True
-
+    USE_FLEX_ATTENTION = os.environ.get("DISABLE_FLEX_ATTENTION", "0") != "1"
+    
     # 默认开启 compile（可用 FLEX_ATTENTION_COMPILE=0 关闭）
     _FLEX_COMPILE_ENABLED = os.environ.get("FLEX_ATTENTION_COMPILE", "1") == "1"
     _FLEX_ATTN_COMPILED = None
@@ -462,6 +459,7 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 mllm_hidden_states: Optional[torch.Tensor] = None,
                 mllm_mask: Optional[torch.Tensor] = None,
+                mllm_kv_len: Optional[int] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
                 **kwargs,
@@ -482,24 +480,24 @@ class WanModel(torch.nn.Module):
             # Expect mllm_hidden_states shape (B, L, Hdim)
             mllm_embeddings = self.mllm_embedding(mllm_hidden_states)
 
+        # Build flex block_mask once (if flex available)
         mllm_block_mask = None
         if (
             USE_FLEX_ATTENTION
             and create_block_mask is not None
-            and self.has_mllm_input
-            and (mllm_embeddings is not None)
-            and (mllm_mask is not None)
+            and mllm_embeddings is not None
+            and mllm_mask is not None
         ):
-            allowed = mllm_mask.to(device=x.device, dtype=torch.bool).contiguous()  # (B, Q, KV)
-            B, Q_LEN, KV_LEN = allowed.shape
-            
+            B, Q_LEN = mllm_mask.shape
+            KV_LEN = mllm_kv_len
+
             def mask_mod(b, h, q_idx, kv_idx):
-                return allowed[b, q_idx, kv_idx]
+                return kv_idx < mllm_mask[b, q_idx]
 
             mllm_block_mask = create_block_mask(
                 mask_mod,
                 B=B,
-                H=None,               
+                H=None,
                 Q_LEN=Q_LEN,
                 KV_LEN=KV_LEN,
                 device=str(x.device),
