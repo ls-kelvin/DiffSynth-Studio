@@ -235,7 +235,8 @@ class WanVideoPipeline(BasePipeline):
         width: Optional[int] = 832,
         num_frames=81,
         use_mllm_condition: Optional[bool] = False,
-        mllm_mode: Optional[Literal["text", "full"]] = "full",
+        mllm_pos_mode: Optional[Literal["text", "full"]] = "full",
+        mllm_neg_mode: Optional[Literal["text", "full"]] = "full",
         # Classifier-free guidance
         cfg_scale: Optional[float] = 5.0,
         cfg_merge: Optional[bool] = False,
@@ -266,12 +267,12 @@ class WanVideoPipeline(BasePipeline):
         
         # Inputs
         inputs_posi = {
-            "prompt": prompt, "mllm_mode": mllm_mode,
+            "prompt": prompt, "mllm_pos_mode": mllm_pos_mode,
             "vap_prompt": vap_prompt,
             "tea_cache_l1_thresh": tea_cache_l1_thresh, "tea_cache_model_id": tea_cache_model_id, "num_inference_steps": num_inference_steps,
         }
         inputs_nega = {
-            "negative_prompt": negative_prompt, "mllm_mode": mllm_mode,
+            "negative_prompt": negative_prompt, "mllm_neg_mode": mllm_neg_mode,
             "negative_vap_prompt": negative_vap_prompt,
             "tea_cache_l1_thresh": tea_cache_l1_thresh, "tea_cache_model_id": tea_cache_model_id, "num_inference_steps": num_inference_steps,
         }
@@ -438,9 +439,9 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
             seperate_cfg=True,
-            input_params_posi={"prompt": "prompt", "mode": "mllm_mode"},
-            input_params_nega={"prompt": "negative_prompt", "mode": "mllm_mode"},
-            input_params=("input_video", "context", "height", "width", "num_frames", "use_mllm_condition"),
+            input_params_posi={"prompt": "prompt", "mode": "mllm_pos_mode"},
+            input_params_nega={"prompt": "negative_prompt", "mode": "mllm_neg_mode"},
+            input_params=("input_video", "height", "width", "num_frames", "use_mllm_condition"),
             output_params=("mllm_hidden_states", "mllm_mask", "mllm_kv_len"),
             onload_model_names=("mllm_encoder",)
         )
@@ -455,8 +456,8 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         return input_video, video_metadata
         
     def encode_prompt(self, pipe: WanVideoPipeline, prompt, input_video, video_metadata, mode="full"):
-        template = "<|im_start|>system\nAnalyze the provided context (either a text description for the first frame or a sequence of preceding video frames). Describe the key visual elements, ongoing motion, camera perspective, and overall scene composition. Then, based on the user's instruction, predict the visual content and dynamics of the next frame(s). Ensure the prediction maintains temporal coherence, logical progression, and consistency with the established style and action.<|im_end|>\n<|im_start|>user\n{}"
-        drop_idx = 87 # index of the begining of user instruction
+        template = "<|im_start|>system\nAnalyze the user's full video instruction and the provided partial video sequence. First, concisely describe the key elements, actions, and scene of the existing video segment. Then, predict the precise visual content for the next segment of video. The prediction must strictly follow the user's full instruction while ensuring seamless temporal continuity in motion, camera work, lighting, and object interactions with the existing frames. For the initial frame (when no video exists), use the instruction as the sole basis to generate the starting scene.<|im_end|>\n<|im_start|>user\n{}"
+        drop_idx = 111 # index of the begining of user instruction
         if prompt == "" or prompt == " ":
             prompt = "  "
         txt = [template.format(prompt + "<|vision_start|><|video_pad|><|vision_end|>") if mode == "full" else template.format(prompt)]
@@ -555,7 +556,7 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         
         return prefix_lengths, mllm_seq_len
 
-    def process(self, pipe: WanVideoPipeline, prompt, input_video, context, height, width, num_frames, use_mllm_condition=False, mode="full"):
+    def process(self, pipe: WanVideoPipeline, prompt, input_video, height, width, num_frames, use_mllm_condition=False, mode="full"):
         if not use_mllm_condition:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
@@ -1447,7 +1448,7 @@ def model_fn_wan_video(
         and mllm_mask is not None
     ):
         B, Q_LEN = mllm_mask.shape
-        KV_LEN = mllm_kv_len
+        KV_LEN = max(512, mllm_kv_len)
 
         def mask_mod(b, h, q_idx, kv_idx):
             return kv_idx < mllm_mask[b, q_idx]

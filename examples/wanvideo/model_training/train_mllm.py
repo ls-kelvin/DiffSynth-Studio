@@ -3,6 +3,8 @@ from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
+import random
+random.seed(42)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def print_trainable_params(model):
@@ -46,6 +48,8 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         min_timestep_boundary=0.0,
         use_mllm_condition=False,
         mllm_processor_path=None,
+        cfg_drop=0.0,
+        mllm_mode="full",
     ):
         super().__init__()
         if not use_gradient_checkpointing:
@@ -79,6 +83,8 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
         self.use_mllm_condition = use_mllm_condition
+        self.cfg_drop = cfg_drop
+        self.mllm_mode = mllm_mode
     
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
@@ -93,7 +99,13 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         return inputs_shared
     
     def get_pipeline_inputs(self, data):
-        inputs_posi = {"prompt": data["prompt"]}
+        if isinstance(data["prompt"], list):
+            prompt = random.choices(data["prompt"], weights=[3,5,2])[0]
+        else:
+            prompt = data["prompt"]
+        if random.random() < self.cfg_drop:
+            prompt = ""
+        inputs_posi = {"prompt": prompt, "mllm_pos_mode": self.mllm_mode}
         inputs_nega = {}
         inputs_shared = {
             "input_video": data["video"],
@@ -134,7 +146,9 @@ def wan_parser():
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--use_mllm_condition", action="store_true", help="Enable MLLM conditioning.")
-    parser.add_argument("--mllm_processor_path", type=str, default=None, help="Path to the MLLM processor.")  # 新增参数
+    parser.add_argument("--mllm_processor_path", type=str, default=None, help="Path to the MLLM processor.")
+    parser.add_argument("--cfg_drop", type=float, default=0.1, help="CFG drop rate.")
+    parser.add_argument("--mllm_mode", type=str, default="full", choices=["text", "full"], help="MLLM mode.")
     return parser
 
 
@@ -188,7 +202,9 @@ if __name__ == "__main__":
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
         use_mllm_condition=args.use_mllm_condition,
-        mllm_processor_path=args.mllm_processor_path,  # 新增参数
+        mllm_processor_path=args.mllm_processor_path,
+        cfg_drop=args.cfg_drop,
+        mllm_mode=args.mllm_mode,
     )
     print_trainable_params(model)
     
