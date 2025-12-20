@@ -242,6 +242,12 @@ class BasePipeline(torch.nn.Module):
                 lora = load_state_dict(lora_config.path, torch_dtype=self.torch_dtype, device=self.device)
         else:
             lora = state_dict
+        def is_lora_key(key: str) -> bool:
+            markers = ("lora_A", "lora_B", "lora_up", "lora_down", "lora_alpha", ".lora_")
+            return any(marker in key for marker in markers)
+        extra_state_dict = {k: v for k, v in lora.items() if not is_lora_key(k)}
+        if extra_state_dict:
+            module.load_state_dict(extra_state_dict, strict=False)
         lora_loader = self.lora_loader(torch_dtype=self.torch_dtype, device=self.device)
         lora = lora_loader.convert_state_dict(lora)
         if hotload is None:
