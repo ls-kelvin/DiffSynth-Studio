@@ -1,5 +1,5 @@
 from .operators import *
-import torch, json, pandas
+import torch, json, pandas, random
 
 
 class UnifiedDataset(torch.utils.data.Dataset):
@@ -10,6 +10,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
         data_file_keys=tuple(),
         main_data_operator=lambda x: x,
         special_operator_map=None,
+        cfg_drop=0.0,
     ):
         self.base_path = base_path
         self.metadata_path = metadata_path
@@ -21,6 +22,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
         self.data = []
         self.cached_data = []
         self.load_from_cache = metadata_path is None
+        self.cfg_drop = cfg_drop
         self.load_metadata(metadata_path)
     
     @staticmethod
@@ -89,6 +91,8 @@ class UnifiedDataset(torch.utils.data.Dataset):
         if self.load_from_cache:
             data = self.cached_data[data_id % len(self.cached_data)]
             data = self.cached_data_operator(data)
+            if random.random() < self.cfg_drop:
+                data[1]["context"] = torch.zeros_like(data[1]["context"])
         else:
             data = self.data[data_id % len(self.data)].copy()
             if "video" in data:
@@ -99,6 +103,8 @@ class UnifiedDataset(torch.utils.data.Dataset):
                         data[key] = self.special_operator_map[key](data[key])
                     elif key in self.data_file_keys:
                         data[key] = self.main_data_operator(data[key])
+            if random.random() < self.cfg_drop:
+                data["prompt"] = ""
         return data
 
     def __len__(self):

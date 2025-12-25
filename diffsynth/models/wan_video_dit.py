@@ -163,13 +163,20 @@ class SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs):
+    def forward(self, x, freqs, block_mask: Optional[object] = None):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
-        x = self.attn(q, k, v)
+        if USE_FLEX_ATTENTION and (block_mask is not None):
+            q_h = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+            k_h = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+            v_h = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+            x = _flex_attention_call(q_h, k_h, v_h, block_mask=block_mask)
+            x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
+        else:
+            x = self.attn(q, k, v)
         return self.o(x)
 
 
@@ -239,6 +246,10 @@ class CrossAttention(nn.Module):
             # Flex 路径：使用“外部一次性构建”的 block_mask
             if USE_FLEX_ATTENTION and (mllm_block_mask is not None):
                 x_mllm = _flex_attention_call(q_h, k_h, v_h, block_mask=mllm_block_mask)
+                x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
+            elif os.getenv("CAUSAL_MASK", "1") == "0":
+                # 非因果遮罩路径
+                x_mllm = flash_attention(q, k_m, v_m, num_heads=self.num_heads)
             else:
                 # SDPA fallback（你的 mllm_mask 保证是 (B, Q, KV)）
                 attn_mask = None
@@ -246,8 +257,8 @@ class CrossAttention(nn.Module):
                     allowed = mllm_mask.to(device=q.device, dtype=torch.bool)
                     attn_mask = (~allowed).unsqueeze(1).expand(q_h.shape[0], self.num_heads, q_h.shape[2], k_h.shape[2])
                 x_mllm = F.scaled_dot_product_attention(q_h, k_h, v_h, attn_mask=attn_mask)
-
-            x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
+                x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
+                
             x = x + self.fuse_linear(x_mllm)
 
         # Image cross-attention (if available)
@@ -293,6 +304,7 @@ class DiTBlock(nn.Module):
         mllm_embeddings: Optional[torch.Tensor] = None,
         mllm_mask: Optional[torch.Tensor] = None,
         mllm_block_mask: Optional[object] = None,
+        dit_block_mask: Optional[object] = None,
     ):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
@@ -308,7 +320,7 @@ class DiTBlock(nn.Module):
             )
 
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, block_mask=dit_block_mask))
 
         x = x + self.cross_attn(
             self.norm3(x),
@@ -460,6 +472,7 @@ class WanModel(torch.nn.Module):
                 mllm_hidden_states: Optional[torch.Tensor] = None,
                 mllm_mask: Optional[torch.Tensor] = None,
                 mllm_kv_len: Optional[int] = None,
+                dit_block_mask: Optional[object] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
                 **kwargs,
@@ -516,19 +529,40 @@ class WanModel(torch.nn.Module):
                 return module(*inputs)
             return custom_forward
 
+        if (
+            dit_block_mask is None
+            and USE_FLEX_ATTENTION
+            and create_block_mask is not None
+            and x.dim() == 3
+        ):
+            B, Q_LEN = x.shape[0], x.shape[1]
+            KV_LEN = x.shape[1]
+
+            def mask_mod(b, h, q_idx, kv_idx):
+                return (q_idx // 1560) * 1560 <= kv_idx < (q_idx // 1560 + 1) * 1560
+
+            dit_block_mask = create_block_mask(
+                mask_mod,
+                B=B,
+                H=None,
+                Q_LEN=Q_LEN,
+                KV_LEN=KV_LEN,
+                device=str(x.device),
+            )
+
         for block in self.blocks:
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                         use_reentrant=False,
                     )
             else:
@@ -537,6 +571,7 @@ class WanModel(torch.nn.Module):
                     mllm_embeddings=mllm_embeddings,
                     mllm_mask=mllm_mask,
                     mllm_block_mask=mllm_block_mask,
+                    dit_block_mask=dit_block_mask,
                 )
 
         x = self.head(x, t)

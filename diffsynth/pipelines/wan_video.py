@@ -1392,6 +1392,8 @@ def model_fn_wan_video(
     # Motion Controller
     if motion_bucket_id is not None and motion_controller is not None:
         t_mod = t_mod + motion_controller(motion_bucket_id).unflatten(1, (6, dit.dim))
+        
+    # Text Embedding
     context = dit.text_embedding(context)
 
     x = latents
@@ -1439,7 +1441,7 @@ def model_fn_wan_video(
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
     
-    # Build flex block_mask once (if flex available)
+    # Build mllm flex block_mask once (if flex available)
     mllm_block_mask = None
     if (
         FLEX_ATTENTION_AVAILABLE
@@ -1461,6 +1463,8 @@ def model_fn_wan_video(
             KV_LEN=KV_LEN,
             device=str(x.device),
         )
+        
+    dit_block_mask = None
 
     # VAP 
     if vap is not None:
@@ -1504,6 +1508,27 @@ def model_fn_wan_video(
     if tea_cache_update:
         x = tea_cache.update(x)
     else:
+        # Build dit block_mask once (if flex available)
+        if (
+            FLEX_ATTENTION_AVAILABLE
+            and create_block_mask is not None
+            and x is not None
+        ):
+            B, Q_LEN = x.shape[0], x.shape[1]
+            KV_LEN = x.shape[1]
+
+            def mask_mod(b, h, q_idx, kv_idx):
+                return (q_idx // 1560) * 1560 <= kv_idx < (q_idx // 1560 + 1) * 1560
+
+            dit_block_mask = create_block_mask(
+                mask_mod,
+                B=B,
+                H=None,
+                Q_LEN=Q_LEN,
+                KV_LEN=KV_LEN,
+                device=str(x.device),
+            )
+
         def create_custom_forward(module):
             def custom_forward(*inputs):
                 return module(*inputs)
@@ -1537,13 +1562,13 @@ def model_fn_wan_video(
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                         use_reentrant=False,
                     )
                 else:
@@ -1552,6 +1577,7 @@ def model_fn_wan_video(
                         mllm_embeddings=mllm_embeddings,
                         mllm_mask=mllm_mask,
                         mllm_block_mask=mllm_block_mask,
+                        dit_block_mask=dit_block_mask,
                     )
             
             # VACE

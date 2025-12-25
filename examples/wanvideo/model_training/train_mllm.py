@@ -48,7 +48,6 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         min_timestep_boundary=0.0,
         use_mllm_condition=False,
         mllm_processor_path=None,
-        cfg_drop=0.0,
         mllm_mode="full",
     ):
         super().__init__()
@@ -83,7 +82,6 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
         self.use_mllm_condition = use_mllm_condition
-        self.cfg_drop = cfg_drop
         self.mllm_mode = mllm_mode
     
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
@@ -103,8 +101,6 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
             prompt = random.choices(data["prompt"], weights=[3,5,2])[0]
         else:
             prompt = data["prompt"]
-        if random.random() < self.cfg_drop:
-            prompt = ""
         inputs_posi = {"prompt": prompt, "mllm_pos_mode": self.mllm_mode}
         inputs_nega = {}
         inputs_shared = {
@@ -178,7 +174,8 @@ if __name__ == "__main__":
         special_operator_map={
             "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
             "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
-        }
+        },
+        cfg_drop=args.cfg_drop,
     )
     model = WanMLLMTrainingModule(
         model_paths=args.model_paths,
@@ -203,7 +200,6 @@ if __name__ == "__main__":
         min_timestep_boundary=args.min_timestep_boundary,
         use_mllm_condition=args.use_mllm_condition,
         mllm_processor_path=args.mllm_processor_path,
-        cfg_drop=args.cfg_drop,
         mllm_mode=args.mllm_mode,
     )
     print_trainable_params(model)
