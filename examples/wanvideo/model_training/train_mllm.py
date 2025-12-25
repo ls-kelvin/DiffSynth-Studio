@@ -12,11 +12,13 @@ def print_trainable_params(model):
     trainable_params = 0
     lora_params = 0
     all_params = 0
+    trainable_params_dict = {}
     
     for name, param in model.named_parameters():
         all_params += param.numel()
         if param.requires_grad:
             trainable_params += param.numel()
+            trainable_params_dict[name] = param.numel()
             if "lora" in name.lower():
                 lora_params += param.numel()
     
@@ -27,6 +29,10 @@ def print_trainable_params(model):
     print(f"  LoRA Parameters:      {lora_params:,}")
     print(f"  LoRA / Trainable:     {lora_params / trainable_params * 100:.2f}%" if trainable_params > 0 else "  LoRA / Trainable:     N/A")
     print(f"{'='*60}\n")
+    
+    with open("trainable_params.txt", "w") as f:
+        for name, count in trainable_params_dict.items():
+            f.write(f"{name}: {count}\n")
 
 
 class WanMLLMTrainingModule(DiffusionTrainingModule):
@@ -202,7 +208,8 @@ if __name__ == "__main__":
         mllm_processor_path=args.mllm_processor_path,
         mllm_mode=args.mllm_mode,
     )
-    print_trainable_params(model)
+    if torch.distributed.get_rank() == 0:
+        print_trainable_params(model)
     
     # Prepare wandb config
     wandb_config = {

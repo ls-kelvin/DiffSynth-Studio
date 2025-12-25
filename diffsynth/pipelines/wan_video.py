@@ -447,7 +447,7 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         )
     
     def process_video_for_mllm(self, pipe: WanVideoPipeline, input_video):
-        indices = list(range(8, len(input_video), 8))
+        indices = list(range(4, len(input_video), 8))
         # Ensure indices are even in length; if odd, remove the last one
         if len(indices) % 2 != 0:
             indices = indices[:-1]
@@ -465,9 +465,6 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         hidden_states = pipe.mllm_encoder(**model_inputs)[-1]
         hidden_states = hidden_states[:, drop_idx:]
         input_ids = model_inputs["input_ids"][:, drop_idx:]
-        if hidden_states.shape[1] < 512:
-            pad_len = 512 - hidden_states.shape[1]
-            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, pad_len), value=0)
         # Return both hidden_states and input_ids for mask calculation
         return hidden_states, input_ids
     
@@ -523,31 +520,19 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
             # No vision tokens, all are text
             text_end = mllm_seq_len
         
-        # Frame 0 (first S_dit tokens): can only attend to text
-        prefix_lengths[:, :S_dit] = min(text_end, mllm_seq_len)
-        
-        # Frame block 1 (4 latent frames = frames 1-16): also only text, no video condition
-        # According to instruction: "dit first generate the first latent frame which correspond to frame 0,
-        # then generate the next block of 4 latent frames, which correspond to video frames 1-16 with no mllm video condition"
-        if num_dit_frames > 1:
-            prefix_lengths[:, S_dit:5*S_dit] = min(text_end, mllm_seq_len)
-        
-        # For subsequent DiT blocks (i >= 5), they can attend to text + video up to their time
-        # Each block of 4 latent frames corresponds to 1 second of video
-        # vision_end_positions mark the end of each 1s video segment in MLLM
-        # Block starting at frame i can see up to (i-5)/4 complete 1s video segments
-        for i in range(5, num_dit_frames):
+        for i in range(0, num_dit_frames):
             start_dit = i * S_dit
             end_dit = (i + 1) * S_dit
             
             # Calculate how many complete 1s video segments this block can see
-            # Blocks 5-8 generate frames for 2nd second, can see 1st second video
-            # Blocks 9-12 generate frames for 3rd second, can see 1st and 2nd second video
-            visible_segments = (i - 1) // 4
+            visible_segments = i // 8
             
-            if visible_segments > 0 and visible_segments <= len(vision_end_positions):
+            if visible_segments == 0:
+                # Can only see text tokens
+                end_mllm = text_end
+            elif visible_segments > 0 and visible_segments <= len(vision_end_positions):
                 # Can attend up to and including the visible_segments-th vision_end
-                end_mllm = vision_end_positions[visible_segments - 1].item() + 1
+                end_mllm = vision_end_positions[visible_segments*2-1].item() + 1
             else:
                 # Can see all available MLLM tokens
                 end_mllm = mllm_seq_len
@@ -1518,7 +1503,7 @@ def model_fn_wan_video(
             KV_LEN = x.shape[1]
 
             def mask_mod(b, h, q_idx, kv_idx):
-                return (q_idx // 1560) * 1560 <= kv_idx < (q_idx // 1560 + 1) * 1560
+                return ((q_idx // (1560*8)) * (1560*8) <= kv_idx) & (kv_idx < (q_idx // (1560*8) + 1) * (1560*8))
 
             dit_block_mask = create_block_mask(
                 mask_mod,

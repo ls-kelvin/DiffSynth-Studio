@@ -539,7 +539,7 @@ class WanModel(torch.nn.Module):
             KV_LEN = x.shape[1]
 
             def mask_mod(b, h, q_idx, kv_idx):
-                return (q_idx // 1560) * 1560 <= kv_idx < (q_idx // 1560 + 1) * 1560
+                return ((q_idx // (1560*8)) * (1560*8) <= kv_idx) & (kv_idx < (q_idx // (1560*8) + 1) * (1560*8))
 
             dit_block_mask = create_block_mask(
                 mask_mod,
