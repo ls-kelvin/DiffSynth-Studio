@@ -178,18 +178,6 @@ class DiffusionTrainingModule(torch.nn.Module):
                 if len(load_result[1]) > 0:
                     print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
             setattr(pipe, lora_base_model, model)
-        # Enable training for newly added MLLM projection layers
-        if hasattr(pipe, "dit") and getattr(pipe, "dit") is not None:
-            module = getattr(pipe.dit, "mllm_embedding", None)
-            if module is not None:
-                for param in module.parameters():
-                    param.requires_grad = True
-            for block in pipe.dit.blocks:
-                for name in ("k_mllm", "v_mllm", "norm_k_mllm", "fuse_linear"):
-                    module = getattr(block.cross_attn, name, None)
-                    if module is not None:
-                        for param in module.parameters():
-                            param.requires_grad = True
 
 
     def split_pipeline_units(self, task, pipe, trainable_models=None, lora_base_model=None):

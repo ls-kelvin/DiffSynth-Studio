@@ -223,7 +223,7 @@ class CrossAttention(nn.Module):
         x: torch.Tensor,
         y: torch.Tensor,
         mllm_embeddings: Optional[torch.Tensor] = None,
-        mllm_cross_mask_prefix: Optional[torch.Tensor] = None,          # 仍保留给 SDPA fallback 用
+        mllm_mask: Optional[torch.Tensor] = None,          # 仍保留给 SDPA fallback 用
         mllm_block_mask: Optional[object] = None,          # flex 用：在 WanModel.forward 里只构建一次
     ):
         if self.has_image_input:
@@ -260,9 +260,9 @@ class CrossAttention(nn.Module):
             else:
                 # SDPA fallback（使用 prefix 长度向量构造允许的 KV）
                 attn_mask = None
-                if mllm_cross_mask_prefix is not None:
+                if mllm_mask is not None:
                     kv_len = v_h.shape[2]
-                    allowed = torch.arange(kv_len, device=q.device) < mllm_cross_mask_prefix.unsqueeze(-1).to(device=q.device)
+                    allowed = torch.arange(kv_len, device=q.device) < mllm_mask.unsqueeze(-1).to(device=q.device)
                     attn_mask = (~allowed).unsqueeze(1).expand(q_h.shape[0], self.num_heads, q_h.shape[2], k_h.shape[2])
                 x_mllm = F.scaled_dot_product_attention(q_h, k_h, v_h, attn_mask=attn_mask)
                 x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
@@ -310,7 +310,7 @@ class DiTBlock(nn.Module):
         t_mod,
         freqs,
         mllm_embeddings: Optional[torch.Tensor] = None,
-        mllm_cross_mask_prefix: Optional[torch.Tensor] = None,
+        mllm_mask: Optional[torch.Tensor] = None,
         mllm_block_mask: Optional[object] = None,
         dit_block_mask: Optional[object] = None,
     ):
@@ -334,7 +334,7 @@ class DiTBlock(nn.Module):
             self.norm3(x),
             context,
             mllm_embeddings=mllm_embeddings,
-            mllm_cross_mask_prefix=mllm_cross_mask_prefix,
+            mllm_mask=mllm_mask,
             mllm_block_mask=mllm_block_mask,
         )
 
@@ -398,7 +398,7 @@ class Qwen3VLMllmEmbedding(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
-        mllm_cross_mask_prefix: Optional[torch.Tensor] = None,
+        mllm_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -417,8 +417,8 @@ class Qwen3VLMllmEmbedding(nn.Module):
         if text_position_ids.shape[0] != batch_size:
             text_position_ids = text_position_ids.expand(batch_size, -1)
 
-        if mllm_cross_mask_prefix is not None:
-            prefix_cross = mllm_cross_mask_prefix.to(device=hidden_states.device, dtype=torch.int64)
+        if mllm_mask is not None:
+            prefix_cross = mllm_mask.to(device=hidden_states.device, dtype=torch.int64)
             if prefix_cross.shape[0] != batch_size:
                 prefix_cross = prefix_cross.expand(batch_size, -1)
 
@@ -581,7 +581,7 @@ class WanModel(torch.nn.Module):
                 clip_feature: Optional[torch.Tensor] = None,
                 y: Optional[torch.Tensor] = None,
                 mllm_hidden_states: Optional[torch.Tensor] = None,
-                mllm_cross_mask_prefix: Optional[torch.Tensor] = None,
+                mllm_mask: Optional[torch.Tensor] = None,
                 mllm_kv_len: Optional[int] = None,
                 mllm_position_ids: Optional[torch.Tensor] = None,
                 dit_block_mask: Optional[object] = None,
@@ -606,7 +606,7 @@ class WanModel(torch.nn.Module):
             mllm_embeddings = self.mllm_embedding(
                 mllm_hidden_states,
                 position_ids=mllm_position_ids,
-                mllm_cross_mask_prefix=mllm_cross_mask_prefix,
+                mllm_mask=mllm_mask,
             )
 
         # Build flex block_mask once (if flex available) for cross-attn
@@ -615,13 +615,13 @@ class WanModel(torch.nn.Module):
             USE_FLEX_ATTENTION
             and create_block_mask is not None
             and mllm_embeddings is not None
-            and mllm_cross_mask_prefix is not None
+            and mllm_mask is not None
         ):
-            B, Q_LEN = mllm_cross_mask_prefix.shape
-            KV_LEN = mllm_kv_len if mllm_kv_len is not None else int(mllm_cross_mask_prefix.max().item())
+            B, Q_LEN = mllm_mask.shape
+            KV_LEN = mllm_kv_len if mllm_kv_len is not None else int(mllm_mask.max().item())
 
             def mask_mod(b, h, q_idx, kv_idx):
-                return kv_idx < mllm_cross_mask_prefix[b, q_idx]
+                return kv_idx < mllm_mask[b, q_idx]
 
             mllm_block_mask = create_block_mask(
                 mask_mod,
@@ -672,20 +672,20 @@ class WanModel(torch.nn.Module):
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, mllm_embeddings, mllm_cross_mask_prefix, mllm_block_mask, dit_block_mask,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, mllm_embeddings, mllm_cross_mask_prefix, mllm_block_mask, dit_block_mask,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                         use_reentrant=False,
                     )
             else:
                 x = block(
                     x, context, t_mod, freqs,
                     mllm_embeddings=mllm_embeddings,
-                    mllm_cross_mask_prefix=mllm_cross_mask_prefix,
+                    mllm_mask=mllm_mask,
                     mllm_block_mask=mllm_block_mask,
                     dit_block_mask=dit_block_mask,
                 )

@@ -36,6 +36,7 @@ except ImportError:
     FLEX_ATTENTION_AVAILABLE = False
     create_block_mask = None
 
+BLOCK_DURATION = 2
 
 class WanVideoPipeline(BasePipeline):
 
@@ -277,6 +278,7 @@ class WanVideoPipeline(BasePipeline):
             "tea_cache_l1_thresh": tea_cache_l1_thresh, "tea_cache_model_id": tea_cache_model_id, "num_inference_steps": num_inference_steps,
         }
         inputs_shared = {
+            "mllm_prompt": prompt,
             "input_image": input_image,
             "end_image": end_image,
             "input_video": input_video, "denoising_strength": denoising_strength,
@@ -438,11 +440,8 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
 class WanVideoUnit_MLLMEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
-            seperate_cfg=True,
-            input_params_posi={"prompt": "prompt", "mode": "mllm_pos_mode"},
-            input_params_nega={"prompt": "negative_prompt", "mode": "mllm_neg_mode"},
-            input_params=("input_video", "height", "width", "num_frames", "use_mllm_condition"),
-            output_params=("mllm_hidden_states", "mllm_cross_mask_prefix", "mllm_kv_len", "mllm_position_ids"),
+            input_params=("input_video", "height", "width", "num_frames", "use_mllm_condition", "mllm_prompt"),
+            output_params=("mllm_hidden_states", "mllm_mask", "mllm_kv_len", "mllm_position_ids"),
             onload_model_names=("mllm_encoder",)
         )
     
@@ -464,9 +463,9 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         model_inputs = pipe.mllm_processor(text=txt, videos=input_video, padding=True, video_metadata=video_metadata, return_tensors="pt", do_resize=False, do_sample_frames=False).to(pipe.device)
         position_ids, _ = pipe.mllm_encoder.model.get_rope_index(
             input_ids=model_inputs["input_ids"],
-            image_grid_thw=model_inputs.get("image_grid_thw"),
-            video_grid_thw=model_inputs.get("video_grid_thw"),
-            attention_mask=model_inputs.get("attention_mask"),
+            image_grid_thw=model_inputs["image_grid_thw"],
+            video_grid_thw=model_inputs["video_grid_thw"],
+            attention_mask=model_inputs["attention_mask"],
         )
         hidden_states = pipe.mllm_encoder(**model_inputs)[-1]
         hidden_states = hidden_states[:, drop_idx:]
@@ -525,14 +524,14 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
             end_dit = (i + 1) * S_dit
             
             # Calculate how many complete 1s video segments this block can see
-            visible_segments = i // 8
+            visible_segments = i // (4 * BLOCK_DURATION)
             
             if visible_segments == 0:
                 # Can only see text tokens
                 end_mllm = text_end
-            elif visible_segments > 0 and visible_segments*2-1 < len(vision_end_positions):
+            elif visible_segments > 0 and visible_segments*BLOCK_DURATION <= len(vision_end_positions):
                 # Can attend up to and including the visible_segments-th vision_end
-                end_mllm = vision_end_positions[visible_segments*2-1].item() + 1
+                end_mllm = vision_end_positions[visible_segments*BLOCK_DURATION-1].item() + 1
             else:
                 # Can see all available MLLM tokens
                 end_mllm = mllm_seq_len
@@ -541,19 +540,19 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         
         return prefix_lengths, mllm_seq_len
 
-    def process(self, pipe: WanVideoPipeline, prompt, input_video, height, width, num_frames, use_mllm_condition=False, mode="full"):
+    def process(self, pipe: WanVideoPipeline, mllm_prompt, input_video, height, width, num_frames, use_mllm_condition=False, mode="full"):
         if not use_mllm_condition:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         if mode == "text":
-            mllm_hidden_states, input_ids, position_ids = self.encode_prompt(pipe, prompt, None, None, mode="text")
+            mllm_hidden_states, input_ids, position_ids = self.encode_prompt(pipe, mllm_prompt, None, None, mode="text")
         else:
             mllm_video, video_metadata = self.process_video_for_mllm(pipe, input_video)
-            mllm_hidden_states, input_ids, position_ids = self.encode_prompt(pipe, prompt, mllm_video, video_metadata, mode="full")
-        mllm_cross_mask_prefix, mllm_kv_len = self.calculate_mllm_mask(pipe, num_frames, height, width, input_ids)
+            mllm_hidden_states, input_ids, position_ids = self.encode_prompt(pipe, mllm_prompt, mllm_video, video_metadata, mode="full")
+        mllm_mask, mllm_kv_len = self.calculate_mllm_mask(pipe, num_frames, height, width, input_ids)
         return {
             "mllm_hidden_states": mllm_hidden_states,
-            "mllm_cross_mask_prefix": mllm_cross_mask_prefix,
+            "mllm_mask": mllm_mask,
             "mllm_kv_len": mllm_kv_len,
             "mllm_position_ids": position_ids,
         }
@@ -1271,7 +1270,7 @@ def model_fn_wan_video(
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
     mllm_hidden_states: torch.Tensor = None,
-    mllm_cross_mask_prefix: torch.Tensor = None,
+    mllm_mask: torch.Tensor = None,
     mllm_kv_len: int = None,
     mllm_position_ids: torch.Tensor = None,
     clip_feature: Optional[torch.Tensor] = None,
@@ -1310,7 +1309,7 @@ def model_fn_wan_video(
             timestep=timestep,
             context=context,
             mllm_hidden_states=mllm_hidden_states,
-            mllm_cross_mask_prefix=mllm_cross_mask_prefix,
+            mllm_mask=mllm_mask,
             mllm_kv_len=mllm_kv_len,
             mllm_position_ids=mllm_position_ids,
             clip_feature=clip_feature,
@@ -1441,13 +1440,13 @@ def model_fn_wan_video(
         FLEX_ATTENTION_AVAILABLE
         and create_block_mask is not None
         and mllm_embeddings is not None
-        and mllm_cross_mask_prefix is not None
+        and mllm_mask is not None
     ):
-        B, Q_LEN = mllm_cross_mask_prefix.shape
-        KV_LEN = max(512, mllm_kv_len if mllm_kv_len is not None else int(mllm_cross_mask_prefix.max().item()))
+        B, Q_LEN = mllm_mask.shape
+        KV_LEN = mllm_kv_len
 
         def mask_mod(b, h, q_idx, kv_idx):
-            return kv_idx < mllm_cross_mask_prefix[b, q_idx]
+            return kv_idx < mllm_mask[b, q_idx]
 
         mllm_block_mask = create_block_mask(
             mask_mod,
@@ -1512,7 +1511,7 @@ def model_fn_wan_video(
             KV_LEN = x.shape[1]
 
             def mask_mod(b, h, q_idx, kv_idx):
-                return ((q_idx // (1560*8)) * (1560*8) <= kv_idx) & (kv_idx < (q_idx // (1560*8) + 1) * (1560*8))
+                return ((q_idx // (1560*4*BLOCK_DURATION)) * (1560*4*BLOCK_DURATION) <= kv_idx) & (kv_idx < (q_idx // (1560*4*BLOCK_DURATION) + 1) * (1560*4*BLOCK_DURATION))
 
             dit_block_mask = create_block_mask(
                 mask_mod,
@@ -1556,20 +1555,20 @@ def model_fn_wan_video(
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, mllm_embeddings, mllm_cross_mask_prefix, mllm_block_mask, dit_block_mask,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, mllm_embeddings, mllm_cross_mask_prefix, mllm_block_mask, dit_block_mask,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                         use_reentrant=False,
                     )
                 else:
                     x = block(
                         x, context, t_mod, freqs,
                         mllm_embeddings=mllm_embeddings,
-                        mllm_cross_mask_prefix=mllm_cross_mask_prefix,
+                        mllm_mask=mllm_mask,
                         mllm_block_mask=mllm_block_mask,
                         dit_block_mask=dit_block_mask,
                     )

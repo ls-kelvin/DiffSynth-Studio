@@ -54,7 +54,7 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         min_timestep_boundary=0.0,
         use_mllm_condition=False,
         mllm_processor_path=None,
-        mllm_mode="full",
+        cfg_drop=0.0,
     ):
         super().__init__()
         if not use_gradient_checkpointing:
@@ -88,7 +88,47 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
         self.use_mllm_condition = use_mllm_condition
-        self.mllm_mode = mllm_mode
+        self.cfg_drop = cfg_drop
+
+    def switch_pipe_to_training_mode(
+        self,
+        pipe,
+        trainable_models=None,
+        lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
+        preset_lora_path=None, preset_lora_model=None,
+        task="sft",
+    ):
+        super().switch_pipe_to_training_mode(
+            pipe,
+            trainable_models=trainable_models,
+            lora_base_model=lora_base_model,
+            lora_target_modules=lora_target_modules,
+            lora_rank=lora_rank,
+            lora_checkpoint=lora_checkpoint,
+            preset_lora_path=preset_lora_path,
+            preset_lora_model=preset_lora_model,
+            task=task,
+        )
+
+        def enable_mllm_params(dit_model):
+            enabled = []
+            if dit_model is None:
+                return enabled
+            for name, param in dit_model.named_parameters():
+                if any(key in name for key in ["mllm_embedding", "k_mllm", "v_mllm", "norm_k_mllm", "fuse_linear"]):
+                    param.requires_grad = True
+                    enabled.append(name)
+            if enabled:
+                dit_model.train()
+            return enabled
+
+        enabled_params = []
+        for model_name in ["dit", "dit2"]:
+            if hasattr(pipe, model_name):
+                enabled_params.extend(enable_mllm_params(getattr(pipe, model_name)))
+
+        if enabled_params:
+            print(f"Enabled full finetuning for {len(enabled_params)} MLLM parameters; other parts remain LoRA-only.")
     
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
@@ -107,9 +147,11 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
             prompt = random.choices(data["prompt"], weights=[3,5,2])[0]
         else:
             prompt = data["prompt"]
-        inputs_posi = {"prompt": prompt, "mllm_pos_mode": self.mllm_mode}
+        
+        inputs_posi = {"prompt": "" if self.cfg_drop > 0 and random.random() < self.cfg_drop else prompt}
         inputs_nega = {}
         inputs_shared = {
+            "mllm_prompt": prompt,
             "input_video": data["video"],
             "height": data["video"][0].size[1],
             "width": data["video"][0].size[0],
@@ -149,8 +191,7 @@ def wan_parser():
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--use_mllm_condition", action="store_true", help="Enable MLLM conditioning.")
     parser.add_argument("--mllm_processor_path", type=str, default=None, help="Path to the MLLM processor.")
-    parser.add_argument("--cfg_drop", type=float, default=0.1, help="CFG drop rate.")
-    parser.add_argument("--mllm_mode", type=str, default="full", choices=["text", "full"], help="MLLM mode.")
+    parser.add_argument("--cfg_drop", type=float, default=0.0, help="CFG drop rate.")
     return parser
 
 
@@ -206,7 +247,7 @@ if __name__ == "__main__":
         min_timestep_boundary=args.min_timestep_boundary,
         use_mllm_condition=args.use_mllm_condition,
         mllm_processor_path=args.mllm_processor_path,
-        mllm_mode=args.mllm_mode,
+        cfg_drop=args.cfg_drop,
     )
     if torch.distributed.get_rank() == 0:
         print_trainable_params(model)
