@@ -87,7 +87,7 @@ def main():
 
     # Load LoRA
     lora_path = f"./models/train/Wan2.1-T2V-1.3B_lora_ultravideo_{args.run_cate}/step-{args.lora_step}.safetensors"
-    # pipe.load_lora(pipe.dit, lora_path, alpha=1.0)
+    pipe.load_lora(pipe.dit, lora_path, alpha=1.0)
     if rank == 0:
         print(f"✅ LoRA loaded: {lora_path}")
 

@@ -206,14 +206,6 @@ class CrossAttention(nn.Module):
             self.k_img = nn.Linear(dim, dim)
             self.v_img = nn.Linear(dim, dim)
             self.norm_k_img = RMSNorm(dim, eps=eps)
-        if has_mllm_input:
-            # K/V projection for already-projected MLLM embeddings
-            self.k_mllm = nn.Linear(dim, dim)
-            self.v_mllm = nn.Linear(dim, dim)
-            self.norm_k_mllm = RMSNorm(dim, eps=eps)
-            self.fuse_linear = nn.Linear(dim, dim)
-            nn.init.zeros_(self.fuse_linear.weight)
-            nn.init.zeros_(self.fuse_linear.bias)
             
         self.attn = AttentionModule(self.num_heads)
         
@@ -222,9 +214,6 @@ class CrossAttention(nn.Module):
         self,
         x: torch.Tensor,
         y: torch.Tensor,
-        mllm_embeddings: Optional[torch.Tensor] = None,
-        mllm_mask: Optional[torch.Tensor] = None,          # 仍保留给 SDPA fallback 用
-        mllm_block_mask: Optional[object] = None,          # flex 用：在 WanModel.forward 里只构建一次
     ):
         if self.has_image_input:
             img = y[:, :257]
@@ -241,34 +230,6 @@ class CrossAttention(nn.Module):
 
         x = x_t5
 
-        # MLLM decoupled attention
-        if self.has_mllm_input and (mllm_embeddings is not None):
-            k_m = self.norm_k_mllm(self.k_mllm(mllm_embeddings))
-            v_m = self.v_mllm(mllm_embeddings)
-
-            q_h = rearrange(q,   "b s (n d) -> b n s d", n=self.num_heads).contiguous()
-            k_h = rearrange(k_m, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
-            v_h = rearrange(v_m, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
-
-            # Flex 路径：使用“外部一次性构建”的 block_mask
-            if USE_FLEX_ATTENTION and (mllm_block_mask is not None):
-                x_mllm = _flex_attention_call(q_h, k_h, v_h, block_mask=mllm_block_mask)
-                x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
-            elif os.getenv("CAUSAL_MASK", "1") == "0":
-                # 非因果遮罩路径
-                x_mllm = flash_attention(q, k_m, v_m, num_heads=self.num_heads)
-            else:
-                # SDPA fallback（使用 prefix 长度向量构造允许的 KV）
-                attn_mask = None
-                if mllm_mask is not None:
-                    kv_len = v_h.shape[2]
-                    allowed = torch.arange(kv_len, device=q.device) < mllm_mask.unsqueeze(-1).to(device=q.device)
-                    attn_mask = (~allowed).unsqueeze(1).expand(q_h.shape[0], self.num_heads, q_h.shape[2], k_h.shape[2])
-                x_mllm = F.scaled_dot_product_attention(q_h, k_h, v_h, attn_mask=attn_mask)
-                x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
-                
-            x = x + self.fuse_linear(x_mllm)
-
         # Image cross-attention (if available)
         if self.has_image_input:
             k_img = self.norm_k_img(self.k_img(img))
@@ -277,6 +238,65 @@ class CrossAttention(nn.Module):
             x = x + y_img
             
         return self.o(x)
+
+
+class MLLMCrossAttention(nn.Module):
+    """Independent cross-attention for MLLM condition with separate QKVO parameters."""
+    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        # Independent QKVO parameters for MLLM cross-attention
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
+        self.norm_q = RMSNorm(dim, eps=eps)
+        self.norm_k = RMSNorm(dim, eps=eps)
+        
+        # Zero-initialized fusion linear layer
+        self.fuse_linear = nn.Linear(dim, dim)
+        nn.init.zeros_(self.fuse_linear.weight)
+        nn.init.zeros_(self.fuse_linear.bias)
+        
+        self.attn = AttentionModule(self.num_heads)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mllm_embeddings: torch.Tensor,
+        mllm_mask: Optional[torch.Tensor] = None,
+        mllm_block_mask: Optional[object] = None,
+    ) -> torch.Tensor:
+        q = self.norm_q(self.q(x))
+        k = self.norm_k(self.k(mllm_embeddings))
+        v = self.v(mllm_embeddings)
+
+        q_h = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+        k_h = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+        v_h = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+
+        # Flex path: use block_mask built once externally
+        if USE_FLEX_ATTENTION and (mllm_block_mask is not None):
+            x_mllm = _flex_attention_call(q_h, k_h, v_h, block_mask=mllm_block_mask)
+            x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
+        elif os.getenv("CAUSAL_MASK", "1") == "0":
+            # Non-causal mask path
+            x_mllm = flash_attention(q, k, v, num_heads=self.num_heads)
+        else:
+            # SDPA fallback (use prefix length vector to construct allowed KV)
+            attn_mask = None
+            if mllm_mask is not None:
+                kv_len = v_h.shape[2]
+                allowed = torch.arange(kv_len, device=q.device) < mllm_mask.unsqueeze(-1).to(device=q.device)
+                attn_mask = (~allowed).unsqueeze(1).expand(q_h.shape[0], self.num_heads, q_h.shape[2], k_h.shape[2])
+            x_mllm = F.scaled_dot_product_attention(q_h, k_h, v_h, attn_mask=attn_mask)
+            x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
+
+        # Apply output projection and zero-initialized fusion
+        return self.fuse_linear(self.o(x_mllm))
 
 class GateModule(nn.Module):
     def __init__(self,):
@@ -291,10 +311,13 @@ class DiTBlock(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
+        self.has_mllm_input = has_mllm_input
 
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(
             dim, num_heads, eps, has_image_input=has_image_input, has_mllm_input=has_mllm_input)
+        if has_mllm_input:
+            self.cross_attn2 = MLLMCrossAttention(dim, num_heads, eps)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(dim, eps=eps)
@@ -330,13 +353,16 @@ class DiTBlock(nn.Module):
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, block_mask=dit_block_mask))
 
-        x = x + self.cross_attn(
-            self.norm3(x),
-            context,
-            mllm_embeddings=mllm_embeddings,
-            mllm_mask=mllm_mask,
-            mllm_block_mask=mllm_block_mask,
-        )
+        # x = x + self.cross_attn + self.cross_attn2 (cross_attn2 initialized to zero)
+        norm_x = self.norm3(x)
+        x = x + self.cross_attn(norm_x, context)
+        if self.has_mllm_input and (mllm_embeddings is not None):
+            x = x + self.cross_attn2(
+                norm_x,
+                mllm_embeddings,
+                mllm_mask=mllm_mask,
+                mllm_block_mask=mllm_block_mask,
+            )
 
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -365,7 +391,7 @@ class MLP(torch.nn.Module):
 
 
 class Qwen3VLMllmEmbedding(nn.Module):
-    def __init__(self, out_dim: int, num_layers: int = 2):
+    def __init__(self, out_dim: int, num_layers: int = 4):
         super().__init__()
         self.config = Qwen3VLTextConfig(
             hidden_size=2560,
@@ -699,6 +725,25 @@ class WanModel(torch.nn.Module):
 
         When strict=False, missing keys in the provided state_dict are ignored,
         preventing errors when loading old checkpoints that lack newly added MLLM parameters.
+        
+        If cross_attn2 keys are missing, initialize them from corresponding cross_attn weights.
         """
+        # Check if cross_attn2 is missing and cross_attn exists
+        has_cross_attn2 = any("cross_attn2" in k for k in state_dict.keys())
+        
+        if not has_cross_attn2 and self.has_mllm_input:
+            # Initialize cross_attn2 from cross_attn for each block
+            new_keys = {}
+            for key, value in state_dict.items():
+                if ".cross_attn." in key:
+                    # Map cross_attn -> cross_attn2 (only for q, k, v, o, norm_q, norm_k)
+                    cross_attn2_key = key.replace(".cross_attn.", ".cross_attn2.")
+                    # Only copy q, k, v, o, norm_q, norm_k (not image-related)
+                    if any(sub in key for sub in [".q.", ".k.", ".v.", ".o.", ".norm_q.", ".norm_k."]):
+                        # Exclude image-related keys
+                        if not any(sub in key for sub in ["_img"]):
+                            new_keys[cross_attn2_key] = value.clone()
+            state_dict.update(new_keys)
+        
         # Simply delegate to parent with strict=False to allow missing keys
         return super().load_state_dict(state_dict, assign=assign, strict=False)

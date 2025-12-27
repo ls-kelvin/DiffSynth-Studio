@@ -115,7 +115,8 @@ class WanMLLMTrainingModule(DiffusionTrainingModule):
             if dit_model is None:
                 return enabled
             for name, param in dit_model.named_parameters():
-                if any(key in name for key in ["mllm_embedding", "k_mllm", "v_mllm", "norm_k_mllm", "fuse_linear"]):
+                # Enable full finetuning for mllm_embedding and cross_attn2 (new MLLM cross-attention)
+                if any(key in name for key in ["mllm_embedding", "cross_attn2"]):
                     param.requires_grad = True
                     enabled.append(name)
             if enabled:
