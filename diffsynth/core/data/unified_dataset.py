@@ -103,8 +103,6 @@ class UnifiedDataset(torch.utils.data.Dataset):
                         data[key] = self.special_operator_map[key](data[key])
                     elif key in self.data_file_keys:
                         data[key] = self.main_data_operator(data[key])
-            if random.random() < self.cfg_drop:
-                data["prompt"] = ""
         return data
 
     def __len__(self):

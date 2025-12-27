@@ -112,6 +112,8 @@ def launch_training_task(
 
         pbar = tqdm(dataloader_iter, ncols=130, dynamic_ncols=False, 
                    desc=f"Epoch {epoch_id + 1}/{num_epochs}")
+        accumulated_loss = torch.tensor(0.0, device=accelerator.device)
+        micro_steps = 0
 
         for data in pbar:
             with accelerator.accumulate(model):
@@ -120,12 +122,25 @@ def launch_training_task(
                     loss = model({}, inputs=data)
                 else:
                     loss = model(data)
+                loss_detached = loss.detach()
+                accumulated_loss += loss_detached
+                micro_steps += 1
                 accelerator.backward(loss)
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps, loss=loss, epoch=epoch_id)
                 scheduler.step()
-                # show loss on tqdm (no try/except as requested)
-                loss_val = loss.item() if isinstance(loss, torch.Tensor) else float(loss)
+                # Only log to wandb once per full (global) batch, but keep num_steps unchanged
+                if accelerator.sync_gradients:
+                    total_loss = accelerator.gather(accumulated_loss).mean()
+                    global_loss = total_loss / micro_steps
+                    log_loss = global_loss
+                    loss_to_report = global_loss
+                    accumulated_loss.zero_()
+                    micro_steps = 0
+                else:
+                    log_loss = None
+                    loss_to_report = loss_detached
+                model_logger.on_step_end(accelerator, model, save_steps, loss=log_loss, epoch=epoch_id)
+                loss_val = loss_to_report.item() if isinstance(loss_to_report, torch.Tensor) else float(loss_to_report)
                 pbar.set_postfix({"loss": f"{loss_val:.6f}"})
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)

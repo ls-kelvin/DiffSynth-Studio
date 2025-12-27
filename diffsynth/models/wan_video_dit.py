@@ -5,6 +5,13 @@ import math
 from typing import Tuple, Optional
 from einops import rearrange
 from .wan_video_camera_controller import SimpleAdapter
+from transformers.masking_utils import create_causal_mask
+from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLTextDecoderLayer,
+    Qwen3VLTextRMSNorm,
+    Qwen3VLTextRotaryEmbedding,
+)
 
 try:
     import os
@@ -216,7 +223,7 @@ class CrossAttention(nn.Module):
         x: torch.Tensor,
         y: torch.Tensor,
         mllm_embeddings: Optional[torch.Tensor] = None,
-        mllm_mask: Optional[torch.Tensor] = None,          # 仍保留给 SDPA fallback 用
+        mllm_cross_mask_prefix: Optional[torch.Tensor] = None,          # 仍保留给 SDPA fallback 用
         mllm_block_mask: Optional[object] = None,          # flex 用：在 WanModel.forward 里只构建一次
     ):
         if self.has_image_input:
@@ -251,10 +258,11 @@ class CrossAttention(nn.Module):
                 # 非因果遮罩路径
                 x_mllm = flash_attention(q, k_m, v_m, num_heads=self.num_heads)
             else:
-                # SDPA fallback（你的 mllm_mask 保证是 (B, Q, KV)）
+                # SDPA fallback（使用 prefix 长度向量构造允许的 KV）
                 attn_mask = None
-                if mllm_mask is not None:
-                    allowed = mllm_mask.to(device=q.device, dtype=torch.bool)
+                if mllm_cross_mask_prefix is not None:
+                    kv_len = v_h.shape[2]
+                    allowed = torch.arange(kv_len, device=q.device) < mllm_cross_mask_prefix.unsqueeze(-1).to(device=q.device)
                     attn_mask = (~allowed).unsqueeze(1).expand(q_h.shape[0], self.num_heads, q_h.shape[2], k_h.shape[2])
                 x_mllm = F.scaled_dot_product_attention(q_h, k_h, v_h, attn_mask=attn_mask)
                 x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
@@ -302,7 +310,7 @@ class DiTBlock(nn.Module):
         t_mod,
         freqs,
         mllm_embeddings: Optional[torch.Tensor] = None,
-        mllm_mask: Optional[torch.Tensor] = None,
+        mllm_cross_mask_prefix: Optional[torch.Tensor] = None,
         mllm_block_mask: Optional[object] = None,
         dit_block_mask: Optional[object] = None,
     ):
@@ -326,7 +334,7 @@ class DiTBlock(nn.Module):
             self.norm3(x),
             context,
             mllm_embeddings=mllm_embeddings,
-            mllm_mask=mllm_mask,
+            mllm_cross_mask_prefix=mllm_cross_mask_prefix,
             mllm_block_mask=mllm_block_mask,
         )
 
@@ -354,6 +362,108 @@ class MLP(torch.nn.Module):
         if self.has_pos_emb:
             x = x + self.emb_pos.to(dtype=x.dtype, device=x.device)
         return self.proj(x)
+
+
+class Qwen3VLMllmEmbedding(nn.Module):
+    def __init__(self, out_dim: int, num_layers: int = 2):
+        super().__init__()
+        self.config = Qwen3VLTextConfig(
+            hidden_size=2560,
+            intermediate_size=9728,
+            num_hidden_layers=num_layers,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_theta=5000000,
+            max_position_embeddings=262144,
+            attention_bias=False,
+            attention_dropout=0.0,
+            rope_scaling={
+                "rope_type": "default",
+                "mrope_interleaved": True,
+                "mrope_section": [24, 20, 20],
+            },
+            attn_implementation="flex_attention" if USE_FLEX_ATTENTION else None,
+        )
+        self.layers = nn.ModuleList(
+            [Qwen3VLTextDecoderLayer(self.config, layer_idx) for layer_idx in range(num_layers)]
+        )
+        self.norm = Qwen3VLTextRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        self.rotary_emb = Qwen3VLTextRotaryEmbedding(self.config)
+        self.proj = MLP(self.config.hidden_size, out_dim)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        mllm_cross_mask_prefix: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # Align position ids with Qwen3VL text model expectations
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=hidden_states.device, dtype=torch.long).unsqueeze(0)
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            text_position_ids = position_ids[0]
+            position_ids = position_ids[1:]
+        else:
+            text_position_ids = position_ids[0]
+        position_ids = position_ids.to(device=hidden_states.device)
+        text_position_ids = text_position_ids.to(device=hidden_states.device)
+        if text_position_ids.shape[0] != batch_size:
+            text_position_ids = text_position_ids.expand(batch_size, -1)
+
+        if mllm_cross_mask_prefix is not None:
+            prefix_cross = mllm_cross_mask_prefix.to(device=hidden_states.device, dtype=torch.int64)
+            if prefix_cross.shape[0] != batch_size:
+                prefix_cross = prefix_cross.expand(batch_size, -1)
+
+            self_prefix = self.compute_self_prefix(prefix_cross, seq_len, hidden_states.device)
+
+            kv_idx = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len)
+            allowed = kv_idx < self_prefix.unsqueeze(-1)  # (B, Q, KV)
+            attn_mask = (~allowed).unsqueeze(1)  # (B,1,Q,KV)
+
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attn_mask,
+                position_ids=text_position_ids,
+            )
+        hidden_states = self.norm(hidden_states)
+        return self.proj(hidden_states)
+
+    @staticmethod
+    def compute_self_prefix(cross_prefix: torch.Tensor, seq_len: int, device) -> torch.Tensor:
+        """
+        Convert cross prefix (B, Lc) into self prefix (B, seq_len) such that:
+        for each unique rising value v in cross_prefix, positions [prev, v) can see up to v kv tokens.
+        Example: cross=[1,1,4,4,7,7] -> self=[1,4,4,4,7,7,7] when seq_len>=7.
+        """
+        batch_size = cross_prefix.shape[0]
+        self_prefix = torch.full((batch_size, seq_len), seq_len, device=device, dtype=torch.int64)
+        for b in range(batch_size):
+            uniques = torch.unique_consecutive(cross_prefix[b]).tolist()
+            prev = 0
+            last_v = seq_len
+            for v in uniques:
+                v_int = int(v)
+                end = min(v_int, seq_len)
+                if end > prev:
+                    self_prefix[b, prev:end] = v_int
+                prev = min(end, seq_len)
+                last_v = v_int
+                if prev >= seq_len:
+                    break
+            if prev < seq_len:
+                self_prefix[b, prev:] = min(last_v, seq_len)
+        return self_prefix
 
 
 class Head(nn.Module):
@@ -398,6 +508,7 @@ class WanModel(torch.nn.Module):
         require_clip_embedding: bool = True,
         fuse_vae_embedding_in_latents: bool = False,
         has_mllm_input: bool = False,
+        mllm_embed_num_layers: int = 2,
     ):
         super().__init__()
         self.dim = dim
@@ -420,8 +531,8 @@ class WanModel(torch.nn.Module):
         )
         self.has_mllm_input = has_mllm_input
         if has_mllm_input:
-            # project MLLM hidden states (e.g., 2560) to model dim before feeding blocks
-            self.mllm_embedding = MLP(2560, dim)
+            # Adapt MLLM hidden states via lightweight Qwen3VL text layers, then map to model dim.
+            self.mllm_embedding = Qwen3VLMllmEmbedding(dim, num_layers=mllm_embed_num_layers)
         self.time_embedding = nn.Sequential(
             nn.Linear(freq_dim, dim),
             nn.SiLU(),
@@ -470,8 +581,9 @@ class WanModel(torch.nn.Module):
                 clip_feature: Optional[torch.Tensor] = None,
                 y: Optional[torch.Tensor] = None,
                 mllm_hidden_states: Optional[torch.Tensor] = None,
-                mllm_mask: Optional[torch.Tensor] = None,
+                mllm_cross_mask_prefix: Optional[torch.Tensor] = None,
                 mllm_kv_len: Optional[int] = None,
+                mllm_position_ids: Optional[torch.Tensor] = None,
                 dit_block_mask: Optional[object] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
@@ -491,21 +603,25 @@ class WanModel(torch.nn.Module):
         # Process MLLM hidden states to MLLM embeddings (outer layer responsibility)
         if self.has_mllm_input and mllm_hidden_states is not None:
             # Expect mllm_hidden_states shape (B, L, Hdim)
-            mllm_embeddings = self.mllm_embedding(mllm_hidden_states)
+            mllm_embeddings = self.mllm_embedding(
+                mllm_hidden_states,
+                position_ids=mllm_position_ids,
+                mllm_cross_mask_prefix=mllm_cross_mask_prefix,
+            )
 
-        # Build flex block_mask once (if flex available)
+        # Build flex block_mask once (if flex available) for cross-attn
         mllm_block_mask = None
         if (
             USE_FLEX_ATTENTION
             and create_block_mask is not None
             and mllm_embeddings is not None
-            and mllm_mask is not None
+            and mllm_cross_mask_prefix is not None
         ):
-            B, Q_LEN = mllm_mask.shape
-            KV_LEN = mllm_kv_len
+            B, Q_LEN = mllm_cross_mask_prefix.shape
+            KV_LEN = mllm_kv_len if mllm_kv_len is not None else int(mllm_cross_mask_prefix.max().item())
 
             def mask_mod(b, h, q_idx, kv_idx):
-                return kv_idx < mllm_mask[b, q_idx]
+                return kv_idx < mllm_cross_mask_prefix[b, q_idx]
 
             mllm_block_mask = create_block_mask(
                 mask_mod,
@@ -556,20 +672,20 @@ class WanModel(torch.nn.Module):
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_cross_mask_prefix, mllm_block_mask, dit_block_mask,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_cross_mask_prefix, mllm_block_mask, dit_block_mask,
                         use_reentrant=False,
                     )
             else:
                 x = block(
                     x, context, t_mod, freqs,
                     mllm_embeddings=mllm_embeddings,
-                    mllm_mask=mllm_mask,
+                    mllm_cross_mask_prefix=mllm_cross_mask_prefix,
                     mllm_block_mask=mllm_block_mask,
                     dit_block_mask=dit_block_mask,
                 )
