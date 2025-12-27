@@ -1,0 +1,11 @@
+debug: false
+
+distributed_type: MULTI_GPU
+
+mixed_precision: bf16
+downcast_bf16: 'no'
+main_training_function: main
+enable_cpu_affinity: false
+rdzv_backend: static
+same_network: true
+use_cpu: false
