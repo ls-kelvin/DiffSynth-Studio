@@ -534,7 +534,7 @@ class WanModel(torch.nn.Module):
         require_clip_embedding: bool = True,
         fuse_vae_embedding_in_latents: bool = False,
         has_mllm_input: bool = False,
-        mllm_embed_num_layers: int = 2,
+        mllm_embed_num_layers: int = 4,
     ):
         super().__init__()
         self.dim = dim

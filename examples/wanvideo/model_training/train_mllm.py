@@ -274,6 +274,7 @@ if __name__ == "__main__":
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
         wandb_config=wandb_config,
+        max_checkpoints=args.max_checkpoints,
     )
     launcher_map = {
         "sft:data_process": launch_data_process_task,

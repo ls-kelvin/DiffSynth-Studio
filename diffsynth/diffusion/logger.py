@@ -3,7 +3,7 @@ from accelerate import Accelerator
 
 
 class ModelLogger:
-    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x, use_wandb=False, wandb_project=None, wandb_run_name=None, wandb_config=None):
+    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x, use_wandb=False, wandb_project=None, wandb_run_name=None, wandb_config=None, max_checkpoints=5):
         self.output_path = output_path
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
         self.state_dict_converter = state_dict_converter
@@ -12,6 +12,8 @@ class ModelLogger:
         self.wandb_initialized = False
         self.dataloader_seed = None  # Will be set by runner for checkpoint reproducibility
         self.current_epoch = 0
+        self.max_checkpoints = max_checkpoints
+        self.saved_checkpoints = []  # Track saved checkpoint paths
         
         if self.use_wandb:
             try:
@@ -89,6 +91,7 @@ class ModelLogger:
         Save a checkpoint for resuming training.
         Uses accelerator.save_state() to save model, optimizer, scheduler, and dataloader states.
         Also saves training metadata (epoch, step, dataloader_seed).
+        Automatically removes old checkpoints when max_checkpoints is exceeded.
         """
         checkpoint_dir = os.path.join(self.output_path, f"checkpoint-{self.num_steps}")
         accelerator.save_state(checkpoint_dir)
@@ -104,3 +107,12 @@ class ModelLogger:
             with open(metadata_path, "w") as f:
                 json.dump(metadata, f, indent=2)
             accelerator.print(f"Checkpoint saved to {checkpoint_dir}")
+            
+            # Track and clean up old checkpoints
+            self.saved_checkpoints.append(checkpoint_dir)
+            if self.max_checkpoints is not None and len(self.saved_checkpoints) > self.max_checkpoints:
+                old_checkpoint = self.saved_checkpoints.pop(0)
+                if os.path.exists(old_checkpoint):
+                    import shutil
+                    shutil.rmtree(old_checkpoint)
+                    accelerator.print(f"Removed old checkpoint: {old_checkpoint}")
