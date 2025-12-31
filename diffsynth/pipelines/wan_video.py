@@ -457,14 +457,21 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
     def encode_prompt(self, pipe: WanVideoPipeline, prompt, input_video, video_metadata, mode="full"):
         template = "<|im_start|>system\nAnalyze the user's full video instruction and the provided partial video sequence. First, concisely describe the key elements, actions, and scene of the existing video segment. Then, predict the precise visual content for the next segment of video. The prediction must strictly follow the user's full instruction while ensuring seamless temporal continuity in motion, camera work, lighting, and object interactions with the existing frames. For the initial frame (when no video exists), use the instruction as the sole basis to generate the starting scene.<|im_end|>\n<|im_start|>user\n{}"
         drop_idx = 111 # index of the begining of user instruction
-        txt = [template.format(prompt + "<|vision_start|><|video_pad|><|vision_end|>") if mode == "full" else template.format(prompt)]
-        model_inputs = pipe.mllm_processor(text=txt, videos=input_video, padding=True, video_metadata=video_metadata, return_tensors="pt", do_resize=False, do_sample_frames=False).to(pipe.device)
-        position_ids, _ = pipe.mllm_encoder.model.get_rope_index(
-            input_ids=model_inputs["input_ids"],
-            image_grid_thw=model_inputs["image_grid_thw"],
-            video_grid_thw=model_inputs["video_grid_thw"],
-            attention_mask=model_inputs["attention_mask"],
-        )
+        if mode == "text":
+            txt = [template.format(prompt)]
+            model_inputs = pipe.mllm_processor(text=txt, return_tensors="pt", do_resize=False, do_sample_frames=False).to(pipe.device)
+            position_ids, _ = pipe.mllm_encoder.model.get_rope_index(
+                input_ids=model_inputs["input_ids"],
+                attention_mask=model_inputs["attention_mask"],
+            )
+        else:
+            txt = [template.format(prompt + "<|vision_start|><|video_pad|><|vision_end|>")]
+            model_inputs = pipe.mllm_processor(text=txt, videos=input_video, padding=True, video_metadata=video_metadata, return_tensors="pt", do_resize=False, do_sample_frames=False).to(pipe.device)
+            position_ids, _ = pipe.mllm_encoder.model.get_rope_index(
+                input_ids=model_inputs["input_ids"],
+                video_grid_thw=model_inputs["video_grid_thw"],
+                attention_mask=model_inputs["attention_mask"],
+            )
         hidden_states = pipe.mllm_encoder(**model_inputs)[-1]
         hidden_states = hidden_states[:, drop_idx:]
         input_ids = model_inputs["input_ids"][:, drop_idx:]
@@ -1403,6 +1410,7 @@ def model_fn_wan_video(
         mllm_embeddings = dit.mllm_embedding(
             mllm_hidden_states,
             position_ids=mllm_position_ids,
+            mllm_mask=mllm_mask
         )
     else:
         mllm_embeddings = None
