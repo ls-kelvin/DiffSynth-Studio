@@ -457,8 +457,6 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
     def encode_prompt(self, pipe: WanVideoPipeline, prompt, input_video, video_metadata, mode="full"):
         template = "<|im_start|>system\nAnalyze the user's full video instruction and the provided partial video sequence. First, concisely describe the key elements, actions, and scene of the existing video segment. Then, predict the precise visual content for the next segment of video. The prediction must strictly follow the user's full instruction while ensuring seamless temporal continuity in motion, camera work, lighting, and object interactions with the existing frames. For the initial frame (when no video exists), use the instruction as the sole basis to generate the starting scene.<|im_end|>\n<|im_start|>user\n{}"
         drop_idx = 111 # index of the begining of user instruction
-        if prompt == "" or prompt == " ":
-            prompt = "  "
         txt = [template.format(prompt + "<|vision_start|><|video_pad|><|vision_end|>") if mode == "full" else template.format(prompt)]
         model_inputs = pipe.mllm_processor(text=txt, videos=input_video, padding=True, video_metadata=video_metadata, return_tensors="pt", do_resize=False, do_sample_frames=False).to(pipe.device)
         position_ids, _ = pipe.mllm_encoder.model.get_rope_index(
