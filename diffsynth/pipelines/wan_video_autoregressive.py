@@ -11,9 +11,8 @@ This inference code mimics that behavior by generating blocks sequentially:
 3. Denoise block 1 with T5 text + MLLM text + block 0's MLLM condition
 4. Continue for subsequent blocks...
 
-Key insight: Training uses dit_block_mask to isolate blocks, but during inference
-we generate each block independently with only the relevant MLLM conditions.
-This ensures temporal consistency while enabling autoregressive generation.
+Key optimization: Each block is denoised independently with only its own latents,
+avoiding redundant computation on the full sequence.
 """
 
 import torch
@@ -31,9 +30,8 @@ from .wan_video import (
     WanVideoUnit_PromptEmbedder,
     WanVideoUnit_MLLMEmbedder,
     BLOCK_DURATION,
-    model_fn_wan_video,
 )
-from ..models.wan_video_dit import sinusoidal_embedding_1d
+from ..models.wan_video_dit import WanModel, sinusoidal_embedding_1d
 from ..core import ModelConfig
 
 
@@ -174,10 +172,11 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         block_idx: int,
         num_blocks: int,
         full_latents: torch.Tensor,
-        models: dict,
-        inputs_shared: dict,
-        inputs_posi: dict,
-        inputs_nega: dict,
+        dit: WanModel,
+        context_posi: torch.Tensor,
+        context_nega: torch.Tensor,
+        mllm_embeddings: Optional[torch.Tensor],
+        mllm_mask: Optional[torch.Tensor],
         cfg_scale: float,
         height: int,
         width: int,
@@ -185,15 +184,30 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         progress_bar_cmd=tqdm,
     ) -> torch.Tensor:
         """
-        Denoise a single block of the video.
+        Denoise a single block of the video efficiently.
         
-        Uses full model forward pass but only updates the current block's latents.
-        The dit_block_mask ensures the DiT only attends within the block.
+        Only processes the current block's latents, not the full sequence.
         """
         start_latent, end_latent = self.get_block_latent_range(block_idx, num_frames)
         
-        # Clone full latents to preserve other blocks
-        current_latents = full_latents.clone()
+        # Extract only current block's latents
+        block_latents = full_latents[:, :, start_latent:end_latent].clone()
+        
+        # Calculate spatial dimensions
+        lat_h = height // 16
+        lat_w = width // 16
+        S_dit = lat_h * lat_w
+        
+        # Calculate mllm_mask for this block (all tokens in this block see the same MLLM prefix)
+        block_mllm_mask = None
+        if mllm_mask is not None:
+            # All tokens in this block use the same visibility
+            # The mask value for this block is at position start_latent * S_dit
+            token_idx = start_latent * S_dit
+            if token_idx < mllm_mask.shape[1]:
+                mask_value = mllm_mask[:, token_idx:token_idx+1]
+                num_block_tokens = (end_latent - start_latent) * S_dit
+                block_mllm_mask = mask_value.expand(-1, num_block_tokens)
         
         for progress_id, timestep in enumerate(progress_bar_cmd(
             self.scheduler.timesteps, 
@@ -201,34 +215,44 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         )):
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
             
-            # Update inputs with current latents
-            inputs_shared["latents"] = current_latents
-            
-            # Forward pass (positive)
-            noise_pred_posi = model_fn_wan_video(
-                **models, **inputs_shared, **inputs_posi, 
+            # Forward pass for this block only (positive)
+            noise_pred_posi = model_fn_block(
+                dit=dit,
+                block_latents=block_latents,
                 timestep=timestep,
+                context=context_posi,
+                mllm_embeddings=mllm_embeddings,
+                mllm_mask=block_mllm_mask,
+                start_latent_frame=start_latent,
+                height=height,
+                width=width,
             )
             
             # Forward pass (negative) for CFG
             if cfg_scale != 1.0:
-                noise_pred_nega = model_fn_wan_video(
-                    **models, **inputs_shared, **inputs_nega,
+                noise_pred_nega = model_fn_block(
+                    dit=dit,
+                    block_latents=block_latents,
                     timestep=timestep,
+                    context=context_nega,
+                    mllm_embeddings=None,  # No MLLM for negative
+                    mllm_mask=None,
+                    start_latent_frame=start_latent,
+                    height=height,
+                    width=width,
                 )
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
             else:
                 noise_pred = noise_pred_posi
             
             # Apply scheduler step
-            new_latents = self.scheduler.step(
-                noise_pred, self.scheduler.timesteps[progress_id], current_latents
+            block_latents = self.scheduler.step(
+                noise_pred, self.scheduler.timesteps[progress_id], block_latents
             )
-            
-            # Only update current block's latents, keep others unchanged
-            current_latents[:, :, start_latent:end_latent] = new_latents[:, :, start_latent:end_latent]
         
-        return current_latents
+        # Update full latents with denoised block
+        full_latents[:, :, start_latent:end_latent] = block_latents
+        return full_latents
 
     @torch.no_grad()
     def __call__(
@@ -306,9 +330,10 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         context_posi = prompt_embedder.encode_prompt(self, prompt)
         context_nega = prompt_embedder.encode_prompt(self, negative_prompt)
         
-        # Prepare DiT models
+        # Embed text context once
         self.load_models_to_device(self.in_iteration_models)
-        models = {name: getattr(self, name) for name in self.in_iteration_models}
+        context_posi_emb = self.dit.text_embedding(context_posi)
+        context_nega_emb = self.dit.text_embedding(context_nega)
         
         # Accumulated video frames for MLLM conditioning
         generated_video_frames: List[Image.Image] = []
@@ -334,29 +359,32 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                 current_block=block_idx,
             )
             
-            # Prepare inputs
-            inputs_shared = {
-                "latents": latents,
-                "height": height,
-                "width": width,
-                "num_frames": num_frames,
-                "cfg_scale": cfg_scale,
-                "cfg_merge": False,
-                **mllm_output,
-            }
-            inputs_posi = {"context": context_posi}
-            inputs_nega = {"context": context_nega}
+            # Compute MLLM embeddings if available
+            mllm_embeddings = None
+            mllm_mask = mllm_output.get("mllm_mask")
+            if (
+                mllm_output.get("mllm_hidden_states") is not None
+                and hasattr(self.dit, "has_mllm_input")
+                and self.dit.has_mllm_input
+            ):
+                self.load_models_to_device(self.in_iteration_models)
+                mllm_embeddings = self.dit.mllm_embedding(
+                    mllm_output["mllm_hidden_states"],
+                    position_ids=mllm_output.get("mllm_position_ids"),
+                    mllm_mask=mllm_mask,
+                )
             
-            # Step 2: Denoise this block
+            # Step 2: Denoise this block (only this block's latents)
             self.load_models_to_device(self.in_iteration_models)
             latents = self.denoise_block(
                 block_idx=block_idx,
                 num_blocks=num_blocks,
                 full_latents=latents,
-                models=models,
-                inputs_shared=inputs_shared,
-                inputs_posi=inputs_posi,
-                inputs_nega=inputs_nega,
+                dit=self.dit,
+                context_posi=context_posi_emb,
+                context_nega=context_nega_emb,
+                mllm_embeddings=mllm_embeddings,
+                mllm_mask=mllm_mask,
                 cfg_scale=cfg_scale,
                 height=height,
                 width=width,
@@ -398,3 +426,73 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         
         print(f"Generation complete: {len(video)} frames")
         return video
+
+
+def model_fn_block(
+    dit: WanModel,
+    block_latents: torch.Tensor,
+    timestep: torch.Tensor,
+    context: torch.Tensor,
+    mllm_embeddings: Optional[torch.Tensor] = None,
+    mllm_mask: Optional[torch.Tensor] = None,
+    start_latent_frame: int = 0,
+    height: int = 480,
+    width: int = 832,
+) -> torch.Tensor:
+    """
+    Forward pass for a single block's latents only.
+    
+    This is an optimized version that only processes the current block,
+    avoiding redundant computation on the full sequence.
+    
+    Args:
+        dit: The DiT model
+        block_latents: Latents for this block only, shape (B, C, T_block, H, W)
+        timestep: Current timestep
+        context: Text embeddings (already processed through text_embedding)
+        mllm_embeddings: MLLM embeddings (already processed through mllm_embedding)
+        mllm_mask: MLLM attention mask for this block's tokens
+        start_latent_frame: Starting latent frame index for RoPE positioning
+        height: Video height
+        width: Video width
+        
+    Returns:
+        Noise prediction for this block, same shape as block_latents
+    """
+    # Timestep embedding
+    t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
+    t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
+    
+    x = block_latents
+    
+    # Patchify
+    x = dit.patchify(x, None)  # No camera control for now
+    f, h, w = x.shape[2:]  # f is number of latent frames in this block
+    x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
+    
+    # Compute RoPE frequencies with correct position offset
+    # The frequencies need to account for the block's position in the full sequence
+    freqs = torch.cat([
+        dit.freqs[0][start_latent_frame:start_latent_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    
+    # No block mask needed since we only have one block
+    # No MLLM block mask needed - all tokens in this block see the same MLLM prefix
+    
+    # Process through DiT blocks
+    for block in dit.blocks:
+        x = block(
+            x, context, t_mod, freqs,
+            mllm_embeddings=mllm_embeddings,
+            mllm_mask=mllm_mask,
+            mllm_block_mask=None,  # All tokens see full MLLM sequence up to their visibility
+            dit_block_mask=None,   # No block mask needed for single block
+        )
+    
+    # Head and unpatchify
+    x = dit.head(x, t)
+    x = dit.unpatchify(x, (f, h, w))
+    
+    return x
