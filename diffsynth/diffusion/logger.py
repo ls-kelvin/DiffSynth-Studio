@@ -1,4 +1,4 @@
-import os, json, torch
+import os, json, torch, random
 from accelerate import Accelerator
 
 
@@ -34,6 +34,7 @@ class ModelLogger:
                 project=self.wandb_project,
                 name=self.wandb_run_name,
                 config=self.wandb_config,
+                id=f"{self.wandb_run_name}_{int(random.random()*1000)}"
             )
             self.wandb_initialized = True
     

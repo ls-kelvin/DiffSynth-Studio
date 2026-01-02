@@ -282,18 +282,18 @@ class MLLMCrossAttention(nn.Module):
         if USE_FLEX_ATTENTION and (mllm_block_mask is not None):
             x_mllm = _flex_attention_call(q_h, k_h, v_h, block_mask=mllm_block_mask)
             x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
-        elif os.getenv("CAUSAL_MASK", "1") == "0":
+        else:
             # Non-causal mask path
             x_mllm = flash_attention(q, k, v, num_heads=self.num_heads)
-        else:
-            # SDPA fallback (use prefix length vector to construct allowed KV)
-            attn_mask = None
-            if mllm_mask is not None:
-                kv_len = v_h.shape[2]
-                allowed = torch.arange(kv_len, device=q.device) < mllm_mask.unsqueeze(-1).to(device=q.device)
-                attn_mask = (~allowed).unsqueeze(1).expand(q_h.shape[0], self.num_heads, q_h.shape[2], k_h.shape[2])
-            x_mllm = F.scaled_dot_product_attention(q_h, k_h, v_h, attn_mask=attn_mask)
-            x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
+        # else:
+        #     # SDPA fallback (use prefix length vector to construct allowed KV)
+        #     attn_mask = None
+        #     if mllm_mask is not None:
+        #         kv_len = v_h.shape[2]
+        #         allowed = torch.arange(kv_len, device=q.device) < mllm_mask.unsqueeze(-1).to(device=q.device)
+        #         attn_mask = (~allowed).unsqueeze(1).expand(q_h.shape[0], self.num_heads, q_h.shape[2], k_h.shape[2])
+        #     x_mllm = F.scaled_dot_product_attention(q_h, k_h, v_h, attn_mask=attn_mask)
+        #     x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
 
         # Apply output projection and zero-initialized fusion
         return self.fuse_linear(self.o(x_mllm))

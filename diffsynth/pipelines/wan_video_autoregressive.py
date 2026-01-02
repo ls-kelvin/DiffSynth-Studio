@@ -176,7 +176,6 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         context_posi: torch.Tensor,
         context_nega: torch.Tensor,
         mllm_embeddings: Optional[torch.Tensor],
-        mllm_mask: Optional[torch.Tensor],
         cfg_scale: float,
         height: int,
         width: int,
@@ -198,17 +197,6 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         lat_w = width // 16
         S_dit = lat_h * lat_w
         
-        # Calculate mllm_mask for this block (all tokens in this block see the same MLLM prefix)
-        block_mllm_mask = None
-        if mllm_mask is not None:
-            # All tokens in this block use the same visibility
-            # The mask value for this block is at position start_latent * S_dit
-            token_idx = start_latent * S_dit
-            if token_idx < mllm_mask.shape[1]:
-                mask_value = mllm_mask[:, token_idx:token_idx+1]
-                num_block_tokens = (end_latent - start_latent) * S_dit
-                block_mllm_mask = mask_value.expand(-1, num_block_tokens)
-        
         for progress_id, timestep in enumerate(progress_bar_cmd(
             self.scheduler.timesteps, 
             desc=f"Block {block_idx + 1}/{num_blocks}"
@@ -222,7 +210,6 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                 timestep=timestep,
                 context=context_posi,
                 mllm_embeddings=mllm_embeddings,
-                mllm_mask=block_mllm_mask,
                 start_latent_frame=start_latent,
                 height=height,
                 width=width,
@@ -235,8 +222,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                     block_latents=block_latents,
                     timestep=timestep,
                     context=context_nega,
-                    mllm_embeddings=None,  # No MLLM for negative
-                    mllm_mask=None,
+                    mllm_embeddings=mllm_embeddings,  # No MLLM for negative
                     start_latent_frame=start_latent,
                     height=height,
                     width=width,
@@ -361,7 +347,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
             
             # Compute MLLM embeddings if available
             mllm_embeddings = None
-            mllm_mask = mllm_output.get("mllm_mask")
+            mllm_mask = mllm_output["mllm_mask"]
             if (
                 mllm_output.get("mllm_hidden_states") is not None
                 and hasattr(self.dit, "has_mllm_input")
@@ -370,7 +356,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                 self.load_models_to_device(self.in_iteration_models)
                 mllm_embeddings = self.dit.mllm_embedding(
                     mllm_output["mllm_hidden_states"],
-                    position_ids=mllm_output.get("mllm_position_ids"),
+                    position_ids=mllm_output["mllm_position_ids"],
                     mllm_mask=mllm_mask,
                 )
             
@@ -384,7 +370,6 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                 context_posi=context_posi_emb,
                 context_nega=context_nega_emb,
                 mllm_embeddings=mllm_embeddings,
-                mllm_mask=mllm_mask,
                 cfg_scale=cfg_scale,
                 height=height,
                 width=width,
@@ -434,7 +419,6 @@ def model_fn_block(
     timestep: torch.Tensor,
     context: torch.Tensor,
     mllm_embeddings: Optional[torch.Tensor] = None,
-    mllm_mask: Optional[torch.Tensor] = None,
     start_latent_frame: int = 0,
     height: int = 480,
     width: int = 832,
@@ -486,7 +470,7 @@ def model_fn_block(
         x = block(
             x, context, t_mod, freqs,
             mllm_embeddings=mllm_embeddings,
-            mllm_mask=mllm_mask,
+            mllm_mask=None,
             mllm_block_mask=None,  # All tokens see full MLLM sequence up to their visibility
             dit_block_mask=None,   # No block mask needed for single block
         )
