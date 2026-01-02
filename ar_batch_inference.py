@@ -1,7 +1,7 @@
 import os
 
 os.environ["MLLM_NO_CFG"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"]="false"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import json
 import argparse
@@ -10,15 +10,15 @@ from pathlib import Path
 import torch
 from accelerate import Accelerator
 from diffsynth.utils.data import save_video
-from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
+from diffsynth.pipelines.wan_video_autoregressive import WanVideoAutoregressivePipeline, ModelConfig
 from diffsynth.core.data.unified_dataset import UnifiedDataset
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--jsonl_path", type=str, default="/root/workspace/zzt/data/UltraVideo/benchmark.jsonl",
+    parser.add_argument("--jsonl_path", type=str, default="/root/workspace/zzt/data/UltraVideo/benchmark_new.jsonl",
                         help="Path to JSONL file with fields: {'prompt': str, 'video_file': str}")
-    parser.add_argument("--lora_step", type=int, default=12800)
+    parser.add_argument("--lora_step", type=int, default=48800)
     parser.add_argument("--run_cate", type=str, default="mllm_seperate")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=1)
@@ -66,10 +66,10 @@ def main():
     # Setup
     video_op = UnifiedDataset.default_video_operator(
         base_path="/root/workspace/zzt/data/UltraVideo",
-        height=480, width=832
+        height=480, width=832, num_frames=125
     )
 
-    pipe = WanVideoPipeline.from_pretrained(
+    pipe = WanVideoAutoregressivePipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device=accelerator.device,
         model_configs=[
@@ -112,18 +112,18 @@ def main():
             output_video = pipe(
                 prompt=prompt,
                 negative_prompt=NEG_PROMPT,
-                input_video=input_video,
+                # input_video=input_video,
                 seed=args.seed,
                 tiled=args.tiled,
-                use_mllm_condition=args.use_mllm,
-                mllm_neg_mode="full",
-                num_frames=len(input_video)
+                # use_mllm_condition=args.use_mllm,
+                # mllm_neg_mode="full",
+                num_frames=((len(input_video) + 2) // 32) * 32 + 29
             )
 
             # Safe filename: {video_stem}_{sanitized_prompt_head}_ori.mp4
             stem = Path(video_file).stem
             prompt_head = sanitize_filename(prompt[:60])  # First 60 chars, sanitized
-            filename = f"{stem}.mp4"
+            filename = f"{stem}_ar.mp4"
             save_path = os.path.join(output_dir, filename)
 
             # Avoid overwrite: add _1, _2, ... if exists
