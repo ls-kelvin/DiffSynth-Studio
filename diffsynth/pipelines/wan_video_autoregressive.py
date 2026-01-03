@@ -15,6 +15,7 @@ Key optimization: Each block is denoised independently with only its own latents
 avoiding redundant computation on the full sequence.
 """
 
+import os
 import torch
 import math
 import numpy as np
@@ -34,6 +35,7 @@ from .wan_video import (
 from ..models.wan_video_dit import WanModel, sinusoidal_embedding_1d
 from ..core import ModelConfig
 
+_DEBUG_COMPARE_MASKS = os.environ.get("DEBUG_COMPARE_MASKS", "0") == "1"
 
 class WanVideoAutoregressivePipeline(WanVideoPipeline):
     """
@@ -348,6 +350,18 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
             # Compute MLLM embeddings if available
             mllm_embeddings = None
             mllm_mask = mllm_output["mllm_mask"]
+            if _DEBUG_COMPARE_MASKS:
+                hs = mllm_output.get("mllm_hidden_states")
+                pid = mllm_output.get("mllm_position_ids")
+                kv_len = mllm_output.get("mllm_kv_len")
+                print(
+                    f"[wan_video_ar] block={block_idx} mllm_hidden_states={None if hs is None else tuple(hs.shape)} "
+                    f"mllm_position_ids={None if pid is None else tuple(pid.shape)} "
+                    f"mllm_mask={None if mllm_mask is None else tuple(mllm_mask.shape)} mllm_kv_len={kv_len}"
+                )
+                if mllm_mask is not None:
+                    vals = [int(mllm_mask[0, i].item()) for i in [0, min(1, mllm_mask.shape[1]-1), min(10, mllm_mask.shape[1]-1)]]
+                    print(f"[wan_video_ar] block={block_idx} mllm_mask samples (q=0/1/10)={vals}")
             if (
                 mllm_output.get("mllm_hidden_states") is not None
                 and hasattr(self.dit, "has_mllm_input")
@@ -359,6 +373,8 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                     position_ids=mllm_output["mllm_position_ids"],
                     mllm_mask=mllm_mask,
                 )
+                if _DEBUG_COMPARE_MASKS:
+                    print(f"[wan_video_ar] block={block_idx} mllm_embeddings={tuple(mllm_embeddings.shape)}")
             
             # Step 2: Denoise this block (only this block's latents)
             self.load_models_to_device(self.in_iteration_models)
@@ -453,6 +469,11 @@ def model_fn_block(
     x = dit.patchify(x, None)  # No camera control for now
     f, h, w = x.shape[2:]  # f is number of latent frames in this block
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
+    if _DEBUG_COMPARE_MASKS and (mllm_embeddings is not None):
+        print(
+            f"[wan_video_ar] model_fn_block start_latent_frame={start_latent_frame} f={int(f)} h={int(h)} w={int(w)} "
+            f"Q_LEN={int(x.shape[1])} mllm_embeddings_len={int(mllm_embeddings.shape[1])}"
+        )
     
     # Compute RoPE frequencies with correct position offset
     # The frequencies need to account for the block's position in the full sequence

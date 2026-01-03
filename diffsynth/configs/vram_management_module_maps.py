@@ -83,6 +83,8 @@ VRAM_MANAGEMENT_MODULE_MAPS = {
         "torch.nn.LayerNorm": "diffsynth.core.vram.layers.AutoWrappedModule",
         "diffsynth.models.wan_video_dit.RMSNorm": "diffsynth.core.vram.layers.AutoWrappedModule",
         "torch.nn.Conv2d": "diffsynth.core.vram.layers.AutoWrappedModule",
+        "transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLTextRMSNorm": "diffsynth.core.vram.layers.AutoWrappedModule",
+        "transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLTextRotaryEmbedding": "diffsynth.core.vram.layers.AutoWrappedModule",
     },
     "diffsynth.models.wan_video_image_encoder.WanImageEncoder": {
         "diffsynth.models.wan_video_image_encoder.VisionTransformer": "diffsynth.core.vram.layers.AutoWrappedModule",

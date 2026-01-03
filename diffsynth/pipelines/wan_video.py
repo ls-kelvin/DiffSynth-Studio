@@ -37,6 +37,7 @@ except ImportError:
     create_block_mask = None
 
 BLOCK_DURATION = 2
+_DEBUG_COMPARE_MASKS = os.environ.get("DEBUG_COMPARE_MASKS", "0") == "1"
 
 class WanVideoPipeline(BasePipeline):
 
@@ -1441,7 +1442,23 @@ def model_fn_wan_video(
         dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-    
+
+    if _DEBUG_COMPARE_MASKS:
+        tokens_per_latent_frame = int(h * w)
+        block_tokens = tokens_per_latent_frame * 4 * BLOCK_DURATION
+        q_len = int(x.shape[1]) if x is not None else -1
+        print(
+            f"[wan_video] f={int(f)} h={int(h)} w={int(w)} tokens/frame={tokens_per_latent_frame} "
+            f"BLOCK_DURATION={BLOCK_DURATION} block_tokens={block_tokens} Q_LEN={q_len}"
+        )
+        if mllm_mask is not None:
+            sample_q = [0, min(block_tokens, mllm_mask.shape[1] - 1), min(2 * block_tokens, mllm_mask.shape[1] - 1)]
+            sample_vals = [int(mllm_mask[0, i].item()) for i in sample_q]
+            print(
+                f"[wan_video] mllm_mask shape={tuple(mllm_mask.shape)} mllm_kv_len={mllm_kv_len} "
+                f"samples(q_idx->prefix)={list(zip(sample_q, sample_vals))}"
+            )
+
     # Build mllm flex block_mask once (if flex available)
     mllm_block_mask = None
     if (
@@ -1464,6 +1481,8 @@ def model_fn_wan_video(
             KV_LEN=KV_LEN,
             device=str(x.device),
         )
+        if _DEBUG_COMPARE_MASKS:
+            print(f"[wan_video] built mllm_block_mask: B={B} Q_LEN={Q_LEN} KV_LEN={KV_LEN}")
         
     dit_block_mask = None
 
@@ -1529,6 +1548,8 @@ def model_fn_wan_video(
                 KV_LEN=KV_LEN,
                 device=str(x.device),
             )
+            if _DEBUG_COMPARE_MASKS:
+                print(f"[wan_video] built dit_block_mask: B={B} Q_LEN={Q_LEN} KV_LEN={KV_LEN}")
 
         def create_custom_forward(module):
             def custom_forward(*inputs):
