@@ -66,7 +66,7 @@ def main():
     # Setup
     video_op = UnifiedDataset.default_video_operator(
         base_path="/root/workspace/zzt/data/UltraVideo",
-        height=480, width=832
+        height=480, width=832, num_frames=125
     )
 
     pipe = WanVideoPipeline.from_pretrained(

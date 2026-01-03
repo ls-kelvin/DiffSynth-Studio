@@ -386,12 +386,12 @@ class WanVideoUnit_NoiseInitializer(PipelineUnit):
 class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("input_video", "noise", "tiled", "tile_size", "tile_stride", "vace_reference_image"),
+            input_params=("input_video", "noise", "tiled", "tile_size", "tile_stride", "vace_reference_image", "use_mllm_condition"),
             output_params=("latents", "input_latents"),
             onload_model_names=("vae",)
         )
 
-    def process(self, pipe: WanVideoPipeline, input_video, noise, tiled, tile_size, tile_stride, vace_reference_image):
+    def process(self, pipe: WanVideoPipeline, input_video, noise, tiled, tile_size, tile_stride, vace_reference_image, use_mllm_condition=False):
         if input_video is None:
             return {"latents": noise}
         pipe.load_models_to_device(self.onload_model_names)
@@ -405,6 +405,8 @@ class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
             input_latents = torch.concat([vace_reference_latents, input_latents], dim=2)
         if pipe.scheduler.training:
             return {"latents": noise, "input_latents": input_latents}
+        elif use_mllm_condition:
+            return {"latents": noise}
         else:
             latents = pipe.scheduler.add_noise(input_latents, noise, timestep=pipe.scheduler.timesteps[0])
             return {"latents": latents}
