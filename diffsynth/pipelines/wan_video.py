@@ -468,7 +468,7 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
                 attention_mask=model_inputs["attention_mask"],
             )
         else:
-            txt = [template.format(prompt + "<|vision_start|><|video_pad|><|vision_end|>")]
+            txt = [template.format(prompt + " <|vision_start|><|video_pad|><|vision_end|>")]
             model_inputs = pipe.mllm_processor(text=txt, videos=input_video, padding=True, video_metadata=video_metadata, return_tensors="pt", do_resize=False, do_sample_frames=False).to(pipe.device)
             position_ids, _ = pipe.mllm_encoder.model.get_rope_index(
                 input_ids=model_inputs["input_ids"],

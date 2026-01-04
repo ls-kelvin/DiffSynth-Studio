@@ -488,7 +488,7 @@ class Qwen3VLMllmEmbedding(nn.Module):
                 if prev >= seq_len:
                     break
             if prev < seq_len:
-                self_prefix[b, prev:] = min(last_v, seq_len)
+                self_prefix[b, prev:] = 0   # min(last_v, seq_len)
         return self_prefix
 
 
