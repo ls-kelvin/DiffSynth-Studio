@@ -6,7 +6,8 @@ from .logger import ModelLogger
 
 UNUSED_CACHE_KEYS = {
     "input_video",
-    "noise"
+    "noise",
+    "latents"
 }
 
 
