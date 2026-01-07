@@ -468,10 +468,8 @@ def model_fn_block(
     t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))  # Tensor, shape (B, 6, D), global AdaLN params.
     
     x = block_latents
-    
-    # Patchify
-    x = dit.patchify(x, None)  # No camera control for now
-    f, h, w = x.shape[2:]  # f is number of latent frames in this block
+    x = dit.patchify(x, None)
+    f, h, w = x.shape[2:]
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
     if _DEBUG_COMPARE_MASKS and (mllm_embeddings is not None):
         print(
@@ -487,62 +485,48 @@ def model_fn_block(
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
-    keep_mask = None  # Optional[BoolTensor], shape (Q_LEN_new,), mask to drop clean tokens before head.
-    if start_latent_frame > 0:  # bool, requires clean_latent_frame (B, C, 1, H, W).
-        assert clean_latent_frame is not None, "clean_latent_frame required for blocks after the first."  # expect (B, C, 1, H, W).
-        assert t.dim() == 2, "t must be global (B, D) in autoregressive mode."  # enforce t shape.
-        assert t_mod.dim() == 3, "t_mod must be global (B, 6, D) in autoregressive mode."  # enforce t_mod shape.
-        clean_tokens = dit.patchify(clean_latent_frame, None)  # Tensor, shape (B, C', 1, h, w), patchified clean latent.
-        clean_tokens = rearrange(clean_tokens, 'b c f h w -> b (f h w) c').contiguous()  # Tensor, shape (B, S, C).
-        assert int(clean_tokens.shape[1]) == int(h * w), "clean token count must equal h*w."  # enforce one frame.
-        seg_len = int(clean_tokens.shape[1])  # int, S tokens for clean frame.
-        clean_timestep = t.new_zeros((t.shape[0],))  # Tensor, shape (B,), clean timestep=0.
-        t_clean = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, clean_timestep))  # Tensor, shape (B, D), clean t.
-        t_mod_clean = dit.time_projection(t_clean).unflatten(1, (6, dit.dim))  # Tensor, shape (B, 6, D), clean t_mod.
-        t_noisy = t  # Tensor, shape (B, D), noisy t for this block.
-        t_mod_noisy = t_mod  # Tensor, shape (B, 6, D), noisy t_mod for this block.
-        prev_frame = start_latent_frame - 1  # int, previous frame index for RoPE.
-        clean_freqs = torch.cat([  # Tensor, shape (1, h, w, Df), RoPE components.
-            dit.freqs[0][prev_frame:prev_frame + 1].view(1, 1, 1, -1).expand(1, h, w, -1),  # (1, h, w, Df_t).
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(1, h, w, -1),  # (1, h, w, Df_h).
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(1, h, w, -1)  # (1, h, w, Df_w).
-        ], dim=-1).reshape(h * w, 1, -1).to(x.device)  # Tensor, shape (S, 1, Df).
-        x = torch.cat([clean_tokens, x], dim=1)  # Tensor, shape (B, S+Q_LEN, C), prepend clean tokens.
-        freqs = torch.cat([clean_freqs, freqs], dim=0)  # Tensor, shape (S+Q_LEN, 1, Df), prepend RoPE.
-        t = torch.cat([  # Tensor, shape (B, S+Q_LEN, D), per-token t with clean=0.
-            t_clean[:, None, :].expand(t_clean.shape[0], seg_len, t_clean.shape[-1]),  # (B, S, D) clean t.
-            t_noisy[:, None, :].expand(t_noisy.shape[0], f * h * w, t_noisy.shape[-1]),  # (B, Q_LEN, D) noisy t.
-        ], dim=1)  # concat clean/noisy t, shape (B, S+Q_LEN, D).
-        t_mod = torch.cat([  # Tensor, shape (B, S+Q_LEN, 6, D), per-token t_mod with clean=0.
-            t_mod_clean[:, None, :, :].expand(t_mod_clean.shape[0], seg_len, t_mod_clean.shape[-2], t_mod_clean.shape[-1]),  # (B, S, 6, D).
-            t_mod_noisy[:, None, :, :].expand(t_mod_noisy.shape[0], f * h * w, t_mod_noisy.shape[-2], t_mod_noisy.shape[-1]),  # (B, Q_LEN, 6, D).
-        ], dim=1)  # concat clean/noisy t_mod, shape (B, S+Q_LEN, 6, D).
-        keep_mask = torch.cat(  # BoolTensor, shape (S+Q_LEN,), True for noisy tokens.
-            [
-                torch.zeros(clean_tokens.shape[1], dtype=torch.bool, device=x.device),  # (S,) drop clean tokens.
-                torch.ones(f * h * w, dtype=torch.bool, device=x.device),  # (Q_LEN,) keep noisy tokens.
-            ],
-            dim=0,  # concat along token axis.
-        )  # BoolTensor, shape (S+Q_LEN,), mask for dropping clean tokens.
+    keep_mask = None
+    if start_latent_frame > 0:
+        clean_tokens = dit.patchify(clean_latent_frame, None)
+        clean_tokens = rearrange(clean_tokens, 'b c f h w -> b (f h w) c').contiguous()
+        seg_len = int(clean_tokens.shape[1])
+        
+        clean_timestep = t.new_zeros((t.shape[0],))
+        t_clean = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, clean_timestep))
+        t_mod_clean = dit.time_projection(t_clean).unflatten(1, (6, dit.dim))
+        t_noisy, t_mod_noisy = t, t_mod
+        
+        prev_frame = start_latent_frame - 1
+        clean_freqs = torch.cat([
+            dit.freqs[0][prev_frame:prev_frame + 1].view(1, 1, 1, -1).expand(1, h, w, -1),
+            dit.freqs[1][:h].view(1, h, 1, -1).expand(1, h, w, -1),
+            dit.freqs[2][:w].view(1, 1, w, -1).expand(1, h, w, -1)
+        ], dim=-1).reshape(h * w, 1, -1).to(x.device)
+        
+        x = torch.cat([clean_tokens, x], dim=1)
+        freqs = torch.cat([clean_freqs, freqs], dim=0)
+        t = torch.cat([
+            t_clean[:, None, :].expand(t_clean.shape[0], seg_len, t_clean.shape[-1]),
+            t_noisy[:, None, :].expand(t_noisy.shape[0], f * h * w, t_noisy.shape[-1]),
+        ], dim=1)
+        t_mod = torch.cat([
+            t_mod_clean[:, None, :, :].expand(t_mod_clean.shape[0], seg_len, t_mod_clean.shape[-2], t_mod_clean.shape[-1]),
+            t_mod_noisy[:, None, :, :].expand(t_mod_noisy.shape[0], f * h * w, t_mod_noisy.shape[-2], t_mod_noisy.shape[-1]),
+        ], dim=1)
+        keep_mask = torch.cat([
+            torch.zeros(clean_tokens.shape[1], dtype=torch.bool, device=x.device),
+            torch.ones(f * h * w, dtype=torch.bool, device=x.device),
+        ], dim=0)
     
-    # No block mask needed since we only have one block
-    # No MLLM block mask needed - all tokens in this block see the same MLLM prefix
-    
-    # Process through DiT blocks
     for block in dit.blocks:
-        x = block(
-            x, context, t_mod, freqs,
-            mllm_embeddings=mllm_embeddings,
-            mllm_mask=None,
-            mllm_block_mask=None,  # All tokens see full MLLM sequence up to their visibility
-            dit_block_mask=None,   # No block mask needed for single block
-        )
+        x = block(x, context, t_mod, freqs, mllm_embeddings=mllm_embeddings, mllm_mask=None,
+                 mllm_block_mask=None, dit_block_mask=None)
     
-    # Head and unpatchify
-    if keep_mask is not None:  # Optional[BoolTensor], shape (Q_LEN_new,), keep noisy tokens only.
-        x = x[:, keep_mask]  # Tensor, shape (B, Q_LEN, C), drop clean tokens before head.
-        if t.dim() == 3:  # per-token t exists, shape (B, Q_LEN_new, D).
-            t = t[:, keep_mask]  # Tensor, shape (B, Q_LEN, D), align t with noisy tokens.
+    if keep_mask is not None:
+        x = x[:, keep_mask]
+        if t.dim() == 3:
+            t = t[:, keep_mask]
+    
     x = dit.head(x, t)
     x = dit.unpatchify(x, (f, h, w))
     

@@ -1275,7 +1275,7 @@ def model_fn_wan_video(
     vap: MotWanModel = None,
     animate_adapter: WanAnimateAdapter = None,
     latents: torch.Tensor = None,
-    input_latents: Optional[torch.Tensor] = None,  # (B, C, F_clean, H, W) clean VAE latents for conditioning.
+    input_latents: Optional[torch.Tensor] = None,
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
     mllm_hidden_states: torch.Tensor = None,
@@ -1445,113 +1445,85 @@ def model_fn_wan_video(
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
     
-    tokens_per_latent_frame = int(h * w)  # int, S tokens per latent frame (h*w).
+    tokens_per_latent_frame = int(h * w)
+    keep_mask = None
+    block_ids = None
+    block_latent_frames = 4 * BLOCK_DURATION
+    num_blocks = math.ceil(f / block_latent_frames) if block_latent_frames > 0 else 1
+    
+    if input_latents is not None and num_blocks > 1:
+        frame_offset = max(f - int(input_latents.shape[2]), 0)
+        x_frames = x.view(x.shape[0], f, tokens_per_latent_frame, x.shape[2])
+        freqs_frames = freqs.view(f, tokens_per_latent_frame, 1, freqs.shape[-1])
+        t_frames = t.view(t.shape[0], f, tokens_per_latent_frame, t.shape[-1]) if t.dim() == 3 else None
+        t_mod_frames = t_mod.view(t_mod.shape[0], f, tokens_per_latent_frame, t_mod.shape[-2], t_mod.shape[-1]) if t_mod.dim() == 4 else None
+        
+        clean_timestep = t.new_zeros((t.shape[0],))
+        t_clean = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, clean_timestep))
+        t_mod_clean = dit.time_projection(t_clean).unflatten(1, (6, dit.dim))
+        t_noisy = t if t.dim() == 2 else None
+        t_mod_noisy = t_mod if t_mod.dim() == 3 else None
+        
+        if t_frames is None:
+            t_frames = t_noisy[:, None, None, :].expand(t_noisy.shape[0], f, tokens_per_latent_frame, t_noisy.shape[-1])
+        if t_mod_frames is None:
+            t_mod_frames = t_mod_noisy[:, None, None, :, :].expand(t_mod_noisy.shape[0], f, tokens_per_latent_frame, t_mod_noisy.shape[-2], t_mod_noisy.shape[-1])
+        
+        mllm_frames = mllm_mask.view(mllm_mask.shape[0], f, tokens_per_latent_frame) if mllm_mask is not None else None
 
-    keep_mask = None  # Optional[BoolTensor], shape (Q_LEN,), marks tokens to keep before head.
-    block_ids = None  # Optional[LongTensor], shape (Q_LEN,), block id per token for self-attn mask.
-    block_latent_frames = 4 * BLOCK_DURATION  # int, latent frames per block.
-    num_blocks = math.ceil(f / block_latent_frames) if block_latent_frames > 0 else 1  # int, number of blocks.
-    expected_tokens = f * tokens_per_latent_frame  # int, total tokens before insertion.
-    if input_latents is not None and num_blocks > 1:  # gate insertion with input_latents (B, C, F_clean, H, W).
-        if t.dim() == 3:  # per-token timestep conditioning case, shape (B, Q_LEN, D_t).
-            assert int(t.shape[1]) == expected_tokens, "t token length must match f*h*w."  # enforce alignment.
-        if t_mod.dim() == 4:  # per-token AdaLN modulation case, shape (B, Q_LEN, 6, D).
-            assert int(t_mod.shape[1]) == expected_tokens, "t_mod token length must match f*h*w."  # enforce alignment.
-        if mllm_mask is not None:  # optional per-token MLLM prefix mask, shape (B, Q_LEN).
-            assert int(mllm_mask.shape[1]) == expected_tokens, "mllm_mask length must match f*h*w."  # enforce alignment.
+        x_segments, freqs_segments, block_id_segments, keep_mask_segments = [], [], [], []
+        t_segments, t_mod_segments = [], []
+        mllm_segments = [] if mllm_frames is not None else None
+        clean_cache = {}
+
+        def get_clean_tokens(seq_frame_idx: int):
+            if seq_frame_idx in clean_cache:
+                return clean_cache[seq_frame_idx]
+            clean_frame_idx = seq_frame_idx - frame_offset
+            clean_latent = input_latents[:, :, clean_frame_idx:clean_frame_idx + 1]
+            clean_camera = control_camera_latents_input[:, :, clean_frame_idx:clean_frame_idx + 1] if control_camera_latents_input is not None else None
+            clean_tokens = dit.patchify(clean_latent, clean_camera)
+            clean_tokens = rearrange(clean_tokens, 'b c f h w -> b (f h w) c').contiguous()
+            clean_cache[seq_frame_idx] = clean_tokens
+            return clean_tokens
+
+        for block_idx in range(num_blocks):
+            block_start = block_idx * block_latent_frames
+            block_end = min((block_idx + 1) * block_latent_frames, f)
             
-        frame_offset = max(f - int(input_latents.shape[2]), 0)  # int, offset from noisy frames to clean frames.
-        
-        x_frames = x.view(x.shape[0], f, tokens_per_latent_frame, x.shape[2])  # (B, F, S, C) tokens.
-        freqs_frames = freqs.view(f, tokens_per_latent_frame, 1, freqs.shape[-1])  # (F, S, 1, Df) RoPE.
-        t_frames = None  # Optional[Tensor], per-frame t, shape (B, F, S, D_t) if enabled.
-        t_mod_frames = None  # Optional[Tensor], per-frame t_mod, shape (B, F, S, 6, D) if enabled.
-        
-        # if t.dim() == 3:  # per-token t exists, shape (B, Q_LEN, D_t).
-        #     t_frames = t.view(t.shape[0], f, tokens_per_latent_frame, t.shape[-1])  # (B, F, S, D_t).
-        # if t_mod.dim() == 4:  # per-token t_mod exists, shape (B, Q_LEN, 6, D).
-        #     t_mod_frames = t_mod.view(t_mod.shape[0], f, tokens_per_latent_frame, t_mod.shape[-2], t_mod.shape[-1])  # (B, F, S, 6, D).
-        # assert t.dim() in (2, 3), "t must be 2D or 3D."  # enforce t shape (B, D_t) or (B, Q_LEN, D_t).
-        # assert t_mod.dim() in (3, 4), "t_mod must be 3D or 4D."  # enforce t_mod shape (B, 6, D) or (B, Q_LEN, 6, D).
-        
-        clean_timestep = t.new_zeros((t.shape[0],))  # Tensor, shape (B,), clean timestep=0.
-        t_clean = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, clean_timestep))  # Tensor, shape (B, D_t), clean t.
-        t_mod_clean = dit.time_projection(t_clean).unflatten(1, (6, dit.dim))  # Tensor, shape (B, 6, D), clean t_mod.
-        t_noisy = t if t.dim() == 2 else None  # Optional[Tensor], shape (B, D_t), noisy t when global.
-        t_mod_noisy = t_mod if t_mod.dim() == 3 else None  # Optional[Tensor], shape (B, 6, D), noisy t_mod when global.
-        if t_frames is None:  # bool, expand global t to t_frames (B, F, S, D_t).
-            assert t_noisy is not None, "t_noisy required when t_frames is None."  # enforce (B, D_t).
-            t_frames = t_noisy[:, None, None, :].expand(t_noisy.shape[0], f, tokens_per_latent_frame, t_noisy.shape[-1])  # (B, F, S, D_t).
-        if t_mod_frames is None:  # bool, expand global t_mod to t_mod_frames (B, F, S, 6, D).
-            assert t_mod_noisy is not None, "t_mod_noisy required when t_mod_frames is None."  # enforce (B, 6, D).
-            t_mod_frames = t_mod_noisy[:, None, None, :, :].expand(t_mod_noisy.shape[0], f, tokens_per_latent_frame, t_mod_noisy.shape[-2], t_mod_noisy.shape[-1])  # (B, F, S, 6, D).
-        mllm_frames = None  # Optional[Tensor], per-frame prefix mask, shape (B, F, S).
-        if mllm_mask is not None:  # per-token MLLM prefix lengths exist.
-            mllm_frames = mllm_mask.view(mllm_mask.shape[0], f, tokens_per_latent_frame)  # (B, F, S).
+            if block_idx > 0:
+                prev_frame = block_start - 1
+                clean_tokens = get_clean_tokens(prev_frame)
+                seg_len = clean_tokens.shape[1]
+                x_segments.append(clean_tokens)
+                freqs_segments.append(freqs_frames[prev_frame].reshape(seg_len, 1, freqs_frames.shape[-1]))
+                block_id_segments.append(torch.full((seg_len,), block_idx, device=x.device, dtype=torch.int32))
+                keep_mask_segments.append(torch.zeros((seg_len,), device=x.device, dtype=torch.bool))
+                t_segments.append(t_clean[:, None, :].expand(t_clean.shape[0], seg_len, t_clean.shape[-1]))
+                t_mod_segments.append(t_mod_clean[:, None, :, :].expand(t_mod_clean.shape[0], seg_len, t_mod_clean.shape[-2], t_mod_clean.shape[-1]))
+                if mllm_segments is not None:
+                    block_prefix = mllm_frames[:, block_start, 0]
+                    mllm_segments.append(block_prefix[:, None].expand(mllm_frames.shape[0], seg_len))
 
-        x_segments = []  # list of (B, S_i, C) token segments.
-        freqs_segments = []  # list of (S_i, 1, Df) RoPE segments.
-        block_id_segments = []  # list of (S_i,) block id segments.
-        keep_mask_segments = []  # list of (S_i,) keep mask segments.
-        t_segments = []  # list of (B, S_i, D_t) segments for per-token t.
-        t_mod_segments = []  # list of (B, S_i, 6, D) segments for per-token t_mod.
-        mllm_segments = [] if mllm_frames is not None else None  # Optional[list], (B, S_i) segments.
+            noisy_tokens = x_frames[:, block_start:block_end].reshape(x.shape[0], -1, x.shape[2])
+            seg_len = noisy_tokens.shape[1]
+            x_segments.append(noisy_tokens)
+            freqs_segments.append(freqs_frames[block_start:block_end].reshape(seg_len, 1, freqs_frames.shape[-1]))
+            block_id_segments.append(torch.full((seg_len,), block_idx, device=x.device, dtype=torch.int32))
+            keep_mask_segments.append(torch.ones((seg_len,), device=x.device, dtype=torch.bool))
+            t_segments.append(t_frames[:, block_start:block_end].reshape(t.shape[0], seg_len, t.shape[-1]))
+            t_mod_segments.append(t_mod_frames[:, block_start:block_end].reshape(t_mod.shape[0], seg_len, t_mod.shape[-2], t_mod.shape[-1]))
+            if mllm_segments is not None:
+                mllm_segments.append(mllm_frames[:, block_start:block_end].reshape(mllm_frames.shape[0], seg_len))
 
-        clean_cache = {}  # dict[int, Tensor], cache clean tokens by seq frame idx.
-
-        def get_clean_tokens(seq_frame_idx: int):  # helper, seq_frame_idx is int frame index.
-            if seq_frame_idx in clean_cache:  # cache hit, reuse tokens.
-                return clean_cache[seq_frame_idx]  # (B, S, C) clean tokens.
-            clean_frame_idx = seq_frame_idx - frame_offset  # int, clean frame index in input_latents.
-            assert 0 <= clean_frame_idx < int(input_latents.shape[2]), "clean_frame_idx out of range."  # enforce availability.
-            clean_latent = input_latents[:, :, clean_frame_idx:clean_frame_idx + 1]  # (B, C, 1, H, W) clean latent.
-            clean_camera = None  # Optional[Tensor], camera control for this frame.
-            if control_camera_latents_input is not None:  # optional camera control present.
-                assert clean_frame_idx < int(control_camera_latents_input.shape[2]), "camera control frame missing."  # enforce alignment.
-                clean_camera = control_camera_latents_input[:, :, clean_frame_idx:clean_frame_idx + 1]  # (B, Cc, 1, Hc, Wc).
-            clean_tokens = dit.patchify(clean_latent, clean_camera)  # (B, C', 1, h, w) patchified clean latent.
-            clean_tokens = rearrange(clean_tokens, 'b c f h w -> b (f h w) c').contiguous()  # (B, S, C) clean tokens.
-            assert int(clean_tokens.shape[1]) == int(tokens_per_latent_frame), "clean token count must match tokens_per_latent_frame."  # enforce S=h*w.
-            clean_cache[seq_frame_idx] = clean_tokens  # cache (B, S, C) tokens.
-            return clean_tokens  # (B, S, C) clean tokens.
-
-        for block_idx in range(num_blocks):  # iterate blocks, block_idx is int.
-            block_start = block_idx * block_latent_frames  # int, start latent frame idx.
-            block_end = min((block_idx + 1) * block_latent_frames, f)  # int, end latent frame idx.
-            if block_idx > 0:  # blocks after the first get a clean prefix.
-                prev_frame = block_start - 1  # int, previous block's last frame.
-                clean_tokens = get_clean_tokens(prev_frame)  # (B, S, C) clean tokens.
-                seg_len = clean_tokens.shape[1]  # int, token count for one frame (S).
-                x_segments.append(clean_tokens)  # append (B, S, C) clean tokens.
-                freqs_segments.append(freqs_frames[prev_frame].reshape(seg_len, 1, freqs_frames.shape[-1]))  # (S, 1, Df) RoPE.
-                block_id_segments.append(torch.full((seg_len,), block_idx, device=x.device, dtype=torch.int32))  # (S,) block id.
-                keep_mask_segments.append(torch.zeros((seg_len,), device=x.device, dtype=torch.bool))  # (S,) drop clean before head.
-                t_segments.append(t_clean[:, None, :].expand(t_clean.shape[0], seg_len, t_clean.shape[-1]))  # (B, S, D_t) clean t.
-                t_mod_segments.append(t_mod_clean[:, None, :, :].expand(t_mod_clean.shape[0], seg_len, t_mod_clean.shape[-2], t_mod_clean.shape[-1]))  # (B, S, 6, D) clean t_mod.
-                if mllm_segments is not None:  # per-token mllm prefix present.
-                    block_prefix = mllm_frames[:, block_start, 0]  # (B,) prefix length for this block.
-                    mllm_segments.append(block_prefix[:, None].expand(mllm_frames.shape[0], seg_len))  # (B, S) clean prefix.
-
-            assert block_end > block_start, "block_end must be greater than block_start."  # enforce valid block.
-            noisy_tokens = x_frames[:, block_start:block_end].reshape(x.shape[0], -1, x.shape[2])  # (B, S_block, C).
-            seg_len = noisy_tokens.shape[1]  # int, token count for this noisy segment.
-            x_segments.append(noisy_tokens)  # append (B, S_block, C) noisy tokens.
-            freqs_segments.append(freqs_frames[block_start:block_end].reshape(seg_len, 1, freqs_frames.shape[-1]))  # (S_block, 1, Df).
-            block_id_segments.append(torch.full((seg_len,), block_idx, device=x.device, dtype=torch.int32))  # (S_block,) block id.
-            keep_mask_segments.append(torch.ones((seg_len,), device=x.device, dtype=torch.bool))  # (S_block,) keep noisy tokens.
-            t_segments.append(t_frames[:, block_start:block_end].reshape(t.shape[0], seg_len, t.shape[-1]))  # (B, S_block, D_t) noisy t.
-            t_mod_segments.append(t_mod_frames[:, block_start:block_end].reshape(t_mod.shape[0], seg_len, t_mod.shape[-2], t_mod.shape[-1]))  # (B, S_block, 6, D) noisy t_mod.
-            if mllm_segments is not None:  # per-token mllm prefix present.
-                mllm_segments.append(mllm_frames[:, block_start:block_end].reshape(mllm_frames.shape[0], seg_len))  # (B, S_block).
-
-        x = torch.cat(x_segments, dim=1)  # (B, Q_LEN_new, C) concatenated tokens.
-        freqs = torch.cat(freqs_segments, dim=0)  # (Q_LEN_new, 1, Df) concatenated RoPE.
-        block_ids = torch.cat(block_id_segments, dim=0)  # (Q_LEN_new,) block ids for self-attn.
-        keep_mask = torch.cat(keep_mask_segments, dim=0)  # (Q_LEN_new,) mask for dropping clean tokens.
-        t = torch.cat(t_segments, dim=1)  # Tensor, shape (B, Q_LEN_new, D_t), aligned t with clean/noisy tokens.
-        t_mod = torch.cat(t_mod_segments, dim=1)  # Tensor, shape (B, Q_LEN_new, 6, D), aligned t_mod with clean/noisy tokens.
-        if mllm_segments is not None:  # per-token mllm prefix present.
-            mllm_mask = torch.cat(mllm_segments, dim=1)  # (B, Q_LEN_new) aligned prefixes.
+        x = torch.cat(x_segments, dim=1)
+        freqs = torch.cat(freqs_segments, dim=0)
+        block_ids = torch.cat(block_id_segments, dim=0)
+        keep_mask = torch.cat(keep_mask_segments, dim=0)
+        t = torch.cat(t_segments, dim=1)
+        t_mod = torch.cat(t_mod_segments, dim=1)
+        if mllm_segments is not None:
+            mllm_mask = torch.cat(mllm_segments, dim=1)
 
     if _DEBUG_COMPARE_MASKS:
         block_tokens = tokens_per_latent_frame * 4 * BLOCK_DURATION
@@ -1568,30 +1540,17 @@ def model_fn_wan_video(
                 f"samples(q_idx->prefix)={list(zip(sample_q, sample_vals))}"
             )
 
-    mllm_block_mask = None  # Optional[object], flex-attn block mask for MLLM cross-attn.
-    if (  # bool gate, uses mllm_mask (B, Q_LEN) and mllm_embeddings (B, L_mllm, D).
-        FLEX_ATTENTION_AVAILABLE  # bool, flex attention availability.
-        and create_block_mask is not None  # callable, flex block mask creator.
-        and mllm_embeddings is not None  # Tensor, shape (B, L_mllm, D).
-        and mllm_mask is not None  # Tensor, shape (B, Q_LEN).
-    ):
-        assert int(mllm_mask.shape[1]) == int(x.shape[1]), "mllm_mask length must match x tokens."  # enforce (B, Q_LEN).
-        B, Q_LEN = mllm_mask.shape  # ints, batch and query length.
-        KV_LEN = mllm_kv_len  # int, key/value length for MLLM embeddings.
+    mllm_block_mask = None
+    if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and mllm_embeddings is not None and mllm_mask is not None:
+        B, Q_LEN = mllm_mask.shape
+        KV_LEN = mllm_kv_len
 
-        def mask_mod(b, h, q_idx, kv_idx):  # mask callback, indices are ints.
-            return kv_idx < mllm_mask[b, q_idx]  # bool, prefix constraint per query.
+        def mask_mod(b, h, q_idx, kv_idx):
+            return kv_idx < mllm_mask[b, q_idx]
 
-        mllm_block_mask = create_block_mask(  # build flex block mask.
-            mask_mod,  # callable, prefix rule.
-            B=B,  # int, batch size.
-            H=None,  # Optional[int], head dim unused.
-            Q_LEN=Q_LEN,  # int, query length.
-            KV_LEN=KV_LEN,  # int, key/value length.
-            device=str(x.device),  # str, device for mask.
-        )  # object, flex block mask for MLLM cross-attn.
-        if _DEBUG_COMPARE_MASKS:  # debug guard.
-            print(f"[wan_video] built mllm_block_mask: B={B} Q_LEN={Q_LEN} KV_LEN={KV_LEN}")  # debug log.
+        mllm_block_mask = create_block_mask(mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=str(x.device))
+        if _DEBUG_COMPARE_MASKS:
+            print(f"[wan_video] built mllm_block_mask: B={B} Q_LEN={Q_LEN} KV_LEN={KV_LEN}")
         
     dit_block_mask = None
 
@@ -1634,46 +1593,32 @@ def model_fn_wan_video(
             pad_shape = chunks[0].shape[1] - chunks[-1].shape[1]
             chunks = [torch.nn.functional.pad(chunk, (0, 0, 0, chunks[0].shape[1]-chunk.shape[1]), value=0) for chunk in chunks]
             x = chunks[get_sequence_parallel_rank()]
-    if tea_cache_update:  # bool, TeaCache hit.
-        x = tea_cache.update(x)  # Tensor, shape (B, Q_LEN, C), cached update.
-    else:  # compute full attention pass.
-        if (  # bool gate, uses x (B, Q_LEN, C) for block mask construction.
-            FLEX_ATTENTION_AVAILABLE  # bool, flex attention availability.
-            and create_block_mask is not None  # callable, flex block mask creator.
-            and x is not None  # Tensor, shape (B, Q_LEN, C).
-        ):
-            B, Q_LEN = x.shape[0], x.shape[1]  # ints, batch and token length.
-            KV_LEN = x.shape[1]  # int, key/value length.
+    if tea_cache_update:
+        x = tea_cache.update(x)
+    else:
+        if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and x is not None:
+            B, Q_LEN, KV_LEN = x.shape[0], x.shape[1], x.shape[1]
 
-            if keep_mask is not None:  # bool, clean tokens inserted => rebuild clean-aware block_ids.
-                block_ids_list = []  # list[Tensor], each Tensor shape (S_i,) for one segment.
-                for block_idx in range(num_blocks):  # int, block index.
-                    block_start = block_idx * block_latent_frames  # int, start latent frame index.
-                    block_end = min((block_idx + 1) * block_latent_frames, f)  # int, end latent frame index.
-                    noisy_frames = block_end - block_start  # int, number of noisy frames in this block.
-                    assert noisy_frames > 0, "noisy_frames must be positive."  # enforce non-empty block.
-                    if block_idx > 0:  # bool, blocks after the first have clean prefix.
-                        block_ids_list.append(torch.full((tokens_per_latent_frame,), block_idx, device=x.device, dtype=torch.int32))  # (S,) clean tokens.
-                    block_ids_list.append(torch.full((noisy_frames * tokens_per_latent_frame,), block_idx, device=x.device, dtype=torch.int32))  # (S_block,) noisy tokens.
-                block_ids = torch.cat(block_ids_list, dim=0)  # Tensor, shape (Q_LEN,), clean-aware block ids.
-            elif block_ids is None:  # bool, no clean tokens and block_ids not set.
-                frame_ids = torch.arange(f, device=x.device, dtype=torch.int32)  # (F,) frame indices.
-                block_ids = (frame_ids // block_latent_frames).repeat_interleave(tokens_per_latent_frame)  # (Q_LEN,) block ids.
-            assert int(block_ids.shape[0]) == int(Q_LEN), "block_ids length must match Q_LEN."  # enforce (Q_LEN,).
+            if keep_mask is not None:
+                block_ids_list = []
+                for block_idx in range(num_blocks):
+                    block_start = block_idx * block_latent_frames
+                    block_end = min((block_idx + 1) * block_latent_frames, f)
+                    noisy_frames = block_end - block_start
+                    if block_idx > 0:
+                        block_ids_list.append(torch.full((tokens_per_latent_frame,), block_idx, device=x.device, dtype=torch.int32))
+                    block_ids_list.append(torch.full((noisy_frames * tokens_per_latent_frame,), block_idx, device=x.device, dtype=torch.int32))
+                block_ids = torch.cat(block_ids_list, dim=0)
+            elif block_ids is None:
+                frame_ids = torch.arange(f, device=x.device, dtype=torch.int32)
+                block_ids = (frame_ids // block_latent_frames).repeat_interleave(tokens_per_latent_frame)
             
-            def mask_mod(b, h, q_idx, kv_idx):  # mask callback, indices are ints.
-                return block_ids[q_idx] == block_ids[kv_idx]  # bool, allow within-block attention.
+            def mask_mod(b, h, q_idx, kv_idx):
+                return block_ids[q_idx] == block_ids[kv_idx]
 
-            dit_block_mask = create_block_mask(  # build flex block mask for self-attn.
-                mask_mod,  # callable, within-block rule.
-                B=B,  # int, batch size.
-                H=None,  # Optional[int], head dim unused.
-                Q_LEN=Q_LEN,  # int, query length.
-                KV_LEN=KV_LEN,  # int, key/value length.
-                device=str(x.device),  # str, device for mask.
-            )  # object, flex block mask for self-attn.
-            if _DEBUG_COMPARE_MASKS:  # debug guard.
-                print(f"[wan_video] built dit_block_mask: B={B} Q_LEN={Q_LEN} KV_LEN={KV_LEN}")  # debug log.
+            dit_block_mask = create_block_mask(mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=str(x.device))
+            if _DEBUG_COMPARE_MASKS:
+                print(f"[wan_video] built dit_block_mask: B={B} Q_LEN={Q_LEN} KV_LEN={KV_LEN}")
 
         def create_custom_forward(module):
             def custom_forward(*inputs):
@@ -1740,10 +1685,10 @@ def model_fn_wan_video(
         if tea_cache is not None:
             tea_cache.store(x)
             
-    if keep_mask is not None:  # Optional[BoolTensor], shape (Q_LEN_new,), True for noisy tokens.
-        x = x[:, keep_mask]  # Tensor, shape (B, Q_LEN_noisy, C), drop clean tokens before head.
-        if t.dim() == 3:  # per-token t exists, shape (B, Q_LEN_new, D_t).
-            t = t[:, keep_mask]  # Tensor, shape (B, Q_LEN_noisy, D_t), align t with kept tokens.
+    if keep_mask is not None:
+        x = x[:, keep_mask]
+        if t.dim() == 3:
+            t = t[:, keep_mask]
 
     x = dit.head(x, t)
     if use_unified_sequence_parallel:
