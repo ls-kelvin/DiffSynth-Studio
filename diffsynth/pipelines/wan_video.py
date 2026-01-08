@@ -456,31 +456,137 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         video_metadata = [{"fps": 16, "frames_indices": indices, "total_num_frames": len(input_video)}]
         input_video = [input_video[i] for i in indices]
         return input_video, video_metadata
-        
-    def encode_prompt(self, pipe: WanVideoPipeline, prompt, input_video, video_metadata, mode="full"):
+
+    def _prepare_prompt_inputs(self, pipe: WanVideoPipeline, prompt, input_video, video_metadata, mode="full"):
         template = "<|im_start|>system\nAnalyze the user's full video instruction and the provided partial video sequence. First, concisely describe the key elements, actions, and scene of the existing video segment. Then, predict the precise visual content for the next segment of video. The prediction must strictly follow the user's full instruction while ensuring seamless temporal continuity in motion, camera work, lighting, and object interactions with the existing frames. For the initial frame (when no video exists), use the instruction as the sole basis to generate the starting scene.<|im_end|>\n<|im_start|>user\n{}"
-        drop_idx = 111 # index of the begining of user instruction
+        drop_idx = 111  # index of the begining of user instruction
         if mode == "text":
             txt = [template.format(prompt)]
-            model_inputs = pipe.mllm_processor(text=txt, return_tensors="pt", do_resize=False, do_sample_frames=False).to(pipe.device)
+            model_inputs = pipe.mllm_processor(
+                text=txt, return_tensors="pt", do_resize=False, do_sample_frames=False
+            ).to(pipe.device)
             position_ids, _ = pipe.mllm_encoder.model.get_rope_index(
                 input_ids=model_inputs["input_ids"],
                 attention_mask=model_inputs["attention_mask"],
             )
         else:
             txt = [template.format(prompt + " <|vision_start|><|video_pad|><|vision_end|>")]
-            model_inputs = pipe.mllm_processor(text=txt, videos=input_video, padding=True, video_metadata=video_metadata, return_tensors="pt", do_resize=False, do_sample_frames=False).to(pipe.device)
+            model_inputs = pipe.mllm_processor(
+                text=txt,
+                videos=input_video,
+                padding=True,
+                video_metadata=video_metadata,
+                return_tensors="pt",
+                do_resize=False,
+                do_sample_frames=False,
+            ).to(pipe.device)
             position_ids, _ = pipe.mllm_encoder.model.get_rope_index(
                 input_ids=model_inputs["input_ids"],
                 video_grid_thw=model_inputs["video_grid_thw"],
                 attention_mask=model_inputs["attention_mask"],
             )
+        return model_inputs, position_ids, drop_idx
+
+    def _slice_new_video_inputs(self, model_inputs, cache_state):
+        pixel_values_videos = model_inputs.get("pixel_values_videos")
+        video_grid_thw = model_inputs.get("video_grid_thw")
+        if pixel_values_videos is None or video_grid_thw is None:
+            return None, None, cache_state.get("video_tokens", 0), video_grid_thw
+
+        full_video_tokens = int(pixel_values_videos.shape[1])
+        prev_video_tokens = int(cache_state.get("video_tokens", 0))
+        if full_video_tokens <= prev_video_tokens:
+            return None, None, full_video_tokens, video_grid_thw
+
+        new_pixel_values_videos = pixel_values_videos[:, prev_video_tokens:]
+        new_video_grid_thw = video_grid_thw
+        prev_video_grid_thw = cache_state.get("video_grid_thw")
+        if prev_video_grid_thw is not None:
+            new_video_grid_thw = video_grid_thw.clone()
+            new_video_grid_thw[:, 0] = video_grid_thw[:, 0] - prev_video_grid_thw[:, 0]
+        return new_pixel_values_videos, new_video_grid_thw, full_video_tokens, video_grid_thw
+
+    def encode_prompt(self, pipe: WanVideoPipeline, prompt, input_video, video_metadata, mode="full"):
+        model_inputs, position_ids, drop_idx = self._prepare_prompt_inputs(
+            pipe, prompt, input_video, video_metadata, mode=mode
+        )
         hidden_states = pipe.mllm_encoder(**model_inputs)[-1]
         hidden_states = hidden_states[:, drop_idx:]
         input_ids = model_inputs["input_ids"][:, drop_idx:]
         position_ids = position_ids[..., drop_idx:]
         # Return hidden states alongside ids/masks for downstream attention masking
         return hidden_states, input_ids, position_ids
+
+    def _encode_prompt_with_cache(
+        self,
+        pipe: WanVideoPipeline,
+        prompt,
+        input_video,
+        video_metadata,
+        mode="full",
+        cache_state=None,
+    ):
+        model_inputs, position_ids, drop_idx = self._prepare_prompt_inputs(
+            pipe, prompt, input_video, video_metadata, mode=mode
+        )
+        full_input_ids = model_inputs["input_ids"]
+        full_seq_len = int(full_input_ids.shape[1])
+        if cache_state is None:
+            cache_state = {}
+
+        if cache_state.get("past_key_values") is None:
+            outputs = pipe.mllm_encoder(
+                **model_inputs, position_ids=position_ids, return_cache=True
+            )
+            full_hidden_states = outputs.hidden_states[-1]
+            trim_hidden_states = full_hidden_states[:, drop_idx:]
+            pixel_values_videos = model_inputs.get("pixel_values_videos")
+            full_video_tokens = int(pixel_values_videos.shape[1]) if pixel_values_videos is not None else 0
+            cache_state = {
+                "past_key_values": outputs.past_key_values,
+                "full_seq_len": full_seq_len,
+                "trim_hidden_states": trim_hidden_states,
+                "video_tokens": full_video_tokens,
+                "video_grid_thw": model_inputs.get("video_grid_thw"),
+            }
+        else:
+            prev_full_len = int(cache_state.get("full_seq_len", 0))
+            if full_seq_len > prev_full_len:
+                new_slice = slice(prev_full_len, full_seq_len)
+                input_ids_new = full_input_ids[:, new_slice]
+                attention_mask = model_inputs.get("attention_mask")
+                attention_mask_new = attention_mask[:, new_slice] if attention_mask is not None else None
+                position_ids_new = position_ids[..., new_slice]
+                new_pixel_values_videos, new_video_grid_thw, full_video_tokens, video_grid_thw = self._slice_new_video_inputs(
+                    model_inputs, cache_state
+                )
+                cache_position = torch.arange(prev_full_len, full_seq_len, device=full_input_ids.device)
+                outputs = pipe.mllm_encoder(
+                    input_ids=input_ids_new,
+                    attention_mask=attention_mask_new,
+                    position_ids=position_ids_new,
+                    past_key_values=cache_state["past_key_values"],
+                    pixel_values_videos=new_pixel_values_videos,
+                    video_grid_thw=new_video_grid_thw,
+                    cache_position=cache_position,
+                    return_cache=True,
+                )
+                new_hidden_states = outputs.hidden_states[-1]
+                trim_start = max(drop_idx - prev_full_len, 0)
+                new_hidden_states = new_hidden_states[:, trim_start:]
+                cache_state["trim_hidden_states"] = torch.cat(
+                    [cache_state["trim_hidden_states"], new_hidden_states], dim=1
+                )
+                cache_state["past_key_values"] = outputs.past_key_values
+                cache_state["full_seq_len"] = full_seq_len
+                cache_state["video_tokens"] = full_video_tokens
+                cache_state["video_grid_thw"] = video_grid_thw
+            else:
+                cache_state["full_seq_len"] = full_seq_len
+
+        trim_input_ids = full_input_ids[:, drop_idx:]
+        trim_position_ids = position_ids[..., drop_idx:]
+        return cache_state["trim_hidden_states"], trim_input_ids, trim_position_ids, cache_state
     
     def calculate_mllm_mask(self, pipe: WanVideoPipeline, num_frames, height, width, input_ids):
         """
@@ -548,22 +654,50 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         
         return prefix_lengths, mllm_seq_len
 
-    def process(self, pipe: WanVideoPipeline, mllm_prompt, input_video, height, width, num_frames, use_mllm_condition=False, mode="full"):
+    def process(
+        self,
+        pipe: WanVideoPipeline,
+        mllm_prompt,
+        input_video,
+        height,
+        width,
+        num_frames,
+        use_mllm_condition=False,
+        mode="full",
+        cache_state=None,
+        return_cache: bool = False,
+    ):
         if not use_mllm_condition:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         if mode == "text":
-            mllm_hidden_states, input_ids, position_ids = self.encode_prompt(pipe, mllm_prompt, None, None, mode="text")
+            mllm_video, video_metadata = None, None
         else:
             mllm_video, video_metadata = self.process_video_for_mllm(pipe, input_video)
-            mllm_hidden_states, input_ids, position_ids = self.encode_prompt(pipe, mllm_prompt, mllm_video, video_metadata, mode="full")
+
+        if return_cache:
+            mllm_hidden_states, input_ids, position_ids, cache_state = self._encode_prompt_with_cache(
+                pipe,
+                mllm_prompt,
+                mllm_video,
+                video_metadata,
+                mode=mode,
+                cache_state=cache_state,
+            )
+        else:
+            mllm_hidden_states, input_ids, position_ids = self.encode_prompt(
+                pipe, mllm_prompt, mllm_video, video_metadata, mode=mode
+            )
         mllm_mask, mllm_kv_len = self.calculate_mllm_mask(pipe, num_frames, height, width, input_ids)
-        return {
+        result = {
             "mllm_hidden_states": mllm_hidden_states,
             "mllm_mask": mllm_mask,
             "mllm_kv_len": mllm_kv_len,
             "mllm_position_ids": position_ids,
         }
+        if return_cache:
+            result["mllm_cache"] = cache_state
+        return result
 
 
 

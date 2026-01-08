@@ -146,6 +146,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         width: int,
         num_frames: int,
         current_block: int,
+        cache_state: Optional[dict] = None,
     ) -> dict:
         """
         Encode MLLM condition for the current block.
@@ -159,13 +160,13 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
             # First block: text-only MLLM condition
             result = self.mllm_embedder.process(
                 self, prompt, None, height, width, num_frames,
-                use_mllm_condition=True, mode="text"
+                use_mllm_condition=True, mode="text", cache_state=cache_state, return_cache=True
             )
         else:
             # Subsequent blocks: use accumulated video frames
             result = self.mllm_embedder.process(
                 self, prompt, generated_video_frames, height, width, num_frames,
-                use_mllm_condition=True, mode="full"
+                use_mllm_condition=True, mode="full", cache_state=cache_state, return_cache=True
             )
         return result
 
@@ -329,6 +330,8 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         
         # Accumulated video frames for MLLM conditioning
         generated_video_frames: List[Image.Image] = []
+        mllm_cache_state = None
+        mllm_embed_cache = None
         
         # Process each block sequentially
         for block_idx in range(num_blocks):
@@ -349,7 +352,9 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                 width=width,
                 num_frames=num_frames,
                 current_block=block_idx,
+                cache_state=mllm_cache_state,
             )
+            mllm_cache_state = mllm_output.get("mllm_cache", mllm_cache_state)
             
             # Compute MLLM embeddings if available
             mllm_embeddings = None
@@ -372,11 +377,34 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                 and self.dit.has_mllm_input
             ):
                 self.load_models_to_device(self.in_iteration_models)
-                mllm_embeddings = self.dit.mllm_embedding(
-                    mllm_output["mllm_hidden_states"],
-                    position_ids=mllm_output["mllm_position_ids"],
-                    mllm_mask=mllm_mask,
-                )
+                total_len = int(mllm_output["mllm_hidden_states"].shape[1])
+                if mllm_embed_cache is None:
+                    mllm_embed_cache = {"seq_len": 0, "past_key_values": None, "embeddings": None}
+                prev_len = int(mllm_embed_cache["seq_len"])
+                if total_len > prev_len:
+                    new_hidden_states = mllm_output["mllm_hidden_states"][:, prev_len:]
+                    new_position_ids = mllm_output["mllm_position_ids"][..., prev_len:]
+                    cache_position = torch.arange(prev_len, total_len, device=new_hidden_states.device)
+                    new_embeddings, past_key_values = self.dit.mllm_embedding(
+                        new_hidden_states,
+                        position_ids=new_position_ids,
+                        mllm_mask=mllm_mask,
+                        past_key_values=mllm_embed_cache["past_key_values"],
+                        cache_position=cache_position,
+                        return_cache=True,
+                        total_seq_len=total_len,
+                    )
+                    if mllm_embed_cache["embeddings"] is None:
+                        mllm_embeddings = new_embeddings
+                    else:
+                        mllm_embeddings = torch.cat([mllm_embed_cache["embeddings"], new_embeddings], dim=1)
+                    mllm_embed_cache = {
+                        "seq_len": total_len,
+                        "past_key_values": past_key_values,
+                        "embeddings": mllm_embeddings,
+                    }
+                else:
+                    mllm_embeddings = mllm_embed_cache["embeddings"]
                 if _DEBUG_COMPARE_MASKS:
                     print(f"[wan_video_ar] block={block_idx} mllm_embeddings={tuple(mllm_embeddings.shape)}")
             
