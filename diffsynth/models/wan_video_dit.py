@@ -6,7 +6,6 @@ from typing import Tuple, Optional
 from einops import rearrange
 from .wan_video_camera_controller import SimpleAdapter
 from transformers.masking_utils import create_causal_mask
-from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLTextDecoderLayer,
@@ -426,17 +425,8 @@ class Qwen3VLMllmEmbedding(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         mllm_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        return_cache: bool = False,
-        total_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
-        if return_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
-        if past_key_values is not None and cache_position is None:
-            cache_position = torch.arange(past_len, past_len + seq_len, device=hidden_states.device)
 
         # Align position ids with Qwen3VL text model expectations
         if position_ids is None:
@@ -453,20 +443,15 @@ class Qwen3VLMllmEmbedding(nn.Module):
         if text_position_ids.shape[0] != batch_size:
             text_position_ids = text_position_ids.expand(batch_size, -1)
 
-        if total_seq_len is None:
-            total_seq_len = past_len + seq_len
-
-        attn_mask = None
         if mllm_mask is not None:
             prefix_cross = mllm_mask.to(device=hidden_states.device, dtype=torch.int64)
             if prefix_cross.shape[0] != batch_size:
                 prefix_cross = prefix_cross.expand(batch_size, -1)
 
-            self_prefix = self.compute_self_prefix(prefix_cross, total_seq_len, hidden_states.device)
-            self_prefix_q = self_prefix[:, past_len:past_len + seq_len]
+            self_prefix = self.compute_self_prefix(prefix_cross, seq_len, hidden_states.device)
 
-            kv_idx = torch.arange(total_seq_len, device=hidden_states.device).view(1, 1, total_seq_len)
-            allowed = kv_idx < self_prefix_q.unsqueeze(-1)  # (B, Q, KV)
+            kv_idx = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len)
+            allowed = kv_idx < self_prefix.unsqueeze(-1)  # (B, Q, KV)
             attn_mask = (~allowed).unsqueeze(1)  # (B,1,Q,KV)
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -476,14 +461,9 @@ class Qwen3VLMllmEmbedding(nn.Module):
                 position_embeddings=position_embeddings,
                 attention_mask=attn_mask,
                 position_ids=text_position_ids,
-                past_key_values=past_key_values,
-                cache_position=cache_position,
             )
         hidden_states = self.norm(hidden_states)
-        outputs = self.proj(hidden_states)
-        if return_cache:
-            return outputs, past_key_values
-        return outputs
+        return self.proj(hidden_states)
 
     @staticmethod
     def compute_self_prefix(cross_prefix: torch.Tensor, seq_len: int, device) -> torch.Tensor:

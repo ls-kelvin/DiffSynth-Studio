@@ -94,12 +94,8 @@ class WanMLLMEncoder(nn.Module):
         video_grid_thw: Optional[torch.LongTensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        return_cache: bool = False,
         **kwargs,
     ):
-        use_cache = kwargs.pop("use_cache", None)
-        if use_cache is None:
-            use_cache = return_cache or (past_key_values is not None)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -112,12 +108,9 @@ class WanMLLMEncoder(nn.Module):
             video_grid_thw=video_grid_thw,
             rope_deltas=rope_deltas,
             cache_position=cache_position,
-            use_cache=use_cache,
             output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
             **kwargs,
         )
-        if return_cache:
-            return outputs
         return outputs.hidden_states

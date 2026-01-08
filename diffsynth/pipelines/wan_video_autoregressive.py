@@ -7,7 +7,7 @@ see previous regions' MLLM conditions.
 
 This inference code mimics that behavior by generating blocks sequentially:
 1. First denoise block 0 with only T5 text + MLLM text (no video condition)
-2. Feed the generated video block 0 to MLLM to get its condition
+2. Feed the generated video block 0 (or input_video segment) to MLLM to get its condition
 3. Denoise block 1 with T5 text + MLLM text + block 0's MLLM condition
 4. Continue for subsequent blocks...
 
@@ -40,12 +40,12 @@ _DEBUG_COMPARE_MASKS = os.environ.get("DEBUG_COMPARE_MASKS", "0") == "1"
 class WanVideoAutoregressivePipeline(WanVideoPipeline):
     """
     Autoregressive inference pipeline that generates video blocks sequentially,
-    using MLLM conditions from previously generated blocks.
+    using MLLM conditions from previously generated blocks or provided input video.
     
     This pipeline generates video in a block-by-block manner:
     - Block 0: Generated with text-only MLLM condition
-    - Block 1: Generated with MLLM condition from block 0's video
-    - Block N: Generated with MLLM condition from blocks 0 to N-1's video
+    - Block 1: Generated with MLLM condition from block 0's video (generated or input)
+    - Block N: Generated with MLLM condition from blocks 0 to N-1's video (generated or input)
     
     Each block corresponds to approximately 2 seconds of video (BLOCK_DURATION).
     """
@@ -146,7 +146,6 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         width: int,
         num_frames: int,
         current_block: int,
-        cache_state: Optional[dict] = None,
     ) -> dict:
         """
         Encode MLLM condition for the current block.
@@ -160,13 +159,13 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
             # First block: text-only MLLM condition
             result = self.mllm_embedder.process(
                 self, prompt, None, height, width, num_frames,
-                use_mllm_condition=True, mode="text", cache_state=cache_state, return_cache=True
+                use_mllm_condition=True, mode="text"
             )
         else:
             # Subsequent blocks: use accumulated video frames
             result = self.mllm_embedder.process(
                 self, prompt, generated_video_frames, height, width, num_frames,
-                use_mllm_condition=True, mode="full", cache_state=cache_state, return_cache=True
+                use_mllm_condition=True, mode="full"
             )
         return result
 
@@ -252,6 +251,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         self,
         prompt: str,
         negative_prompt: Optional[str] = "",
+        input_video: Optional[List[Image.Image]] = None,
         seed: Optional[int] = None,
         rand_device: Optional[str] = "cpu",
         height: Optional[int] = 480,
@@ -277,6 +277,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         Args:
             prompt: Text prompt for video generation
             negative_prompt: Negative prompt for CFG
+            input_video: Optional list of PIL frames used as MLLM condition context
             seed: Random seed for reproducibility
             rand_device: Device for random number generation
             height: Video height (will be adjusted to valid dimensions)
@@ -328,10 +329,8 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         context_posi_emb = self.dit.text_embedding(context_posi)
         context_nega_emb = self.dit.text_embedding(context_nega)
         
-        # Accumulated video frames for MLLM conditioning
+        # Accumulated video frames for MLLM conditioning (generated or input)
         generated_video_frames: List[Image.Image] = []
-        mllm_cache_state = None
-        mllm_embed_cache = None
         
         # Process each block sequentially
         for block_idx in range(num_blocks):
@@ -352,9 +351,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                 width=width,
                 num_frames=num_frames,
                 current_block=block_idx,
-                cache_state=mllm_cache_state,
             )
-            mllm_cache_state = mllm_output.get("mllm_cache", mllm_cache_state)
             
             # Compute MLLM embeddings if available
             mllm_embeddings = None
@@ -377,34 +374,11 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                 and self.dit.has_mllm_input
             ):
                 self.load_models_to_device(self.in_iteration_models)
-                total_len = int(mllm_output["mllm_hidden_states"].shape[1])
-                if mllm_embed_cache is None:
-                    mllm_embed_cache = {"seq_len": 0, "past_key_values": None, "embeddings": None}
-                prev_len = int(mllm_embed_cache["seq_len"])
-                if total_len > prev_len:
-                    new_hidden_states = mllm_output["mllm_hidden_states"][:, prev_len:]
-                    new_position_ids = mllm_output["mllm_position_ids"][..., prev_len:]
-                    cache_position = torch.arange(prev_len, total_len, device=new_hidden_states.device)
-                    new_embeddings, past_key_values = self.dit.mllm_embedding(
-                        new_hidden_states,
-                        position_ids=new_position_ids,
-                        mllm_mask=mllm_mask,
-                        past_key_values=mllm_embed_cache["past_key_values"],
-                        cache_position=cache_position,
-                        return_cache=True,
-                        total_seq_len=total_len,
-                    )
-                    if mllm_embed_cache["embeddings"] is None:
-                        mllm_embeddings = new_embeddings
-                    else:
-                        mllm_embeddings = torch.cat([mllm_embed_cache["embeddings"], new_embeddings], dim=1)
-                    mllm_embed_cache = {
-                        "seq_len": total_len,
-                        "past_key_values": past_key_values,
-                        "embeddings": mllm_embeddings,
-                    }
-                else:
-                    mllm_embeddings = mllm_embed_cache["embeddings"]
+                mllm_embeddings = self.dit.mllm_embedding(
+                    mllm_output["mllm_hidden_states"],
+                    position_ids=mllm_output["mllm_position_ids"],
+                    mllm_mask=mllm_mask,
+                )
                 if _DEBUG_COMPARE_MASKS:
                     print(f"[wan_video_ar] block={block_idx} mllm_embeddings={tuple(mllm_embeddings.shape)}")
             
@@ -440,8 +414,11 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
             )
             all_video_frames = self.vae_output_to_video(all_video)
             
-            # Update accumulated frames (replace with properly decoded frames)
-            generated_video_frames = all_video_frames
+            # Update accumulated frames (generated or provided input video)
+            if input_video is not None:
+                generated_video_frames = input_video[:end_frame]
+            else:
+                generated_video_frames = all_video_frames
             print(f"  Decoded {len(all_video_frames)} frames up to block {block_idx}")
         
         # Final full decode
