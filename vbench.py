@@ -16,9 +16,9 @@ from diffsynth.core.data.unified_dataset import UnifiedDataset
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--jsonl_path", type=str, default="/root/workspace/zzt/data/UltraVideo/valid_new.jsonl",
+    parser.add_argument("--jsonl_path", type=str, default="/root/workspace/zzt/data/UltraVideo/vbench_expand.jsonl",
                         help="Path to JSONL file with fields: {'prompt': str, 'video_file': str}")
-    parser.add_argument("--prompt_type", type=str, default="recaption")
+    parser.add_argument("--prompt_type", type=str, default="extended_prompt")
     parser.add_argument("--lora_step", type=int, default=48800)
     parser.add_argument("--run_cate", type=str, default="local_vae")
     parser.add_argument("--output_dir", type=str, default=None)
@@ -64,12 +64,6 @@ def main():
 
     accelerator.print(f"[Rank {rank}] Assigned {len(local_items)} / {len(all_items)} items.")
 
-    # Setup
-    video_op = UnifiedDataset.default_video_operator(
-        base_path="/root/workspace/zzt/data/UltraVideo",
-        height=480, width=832, num_frames=125
-    )
-
     pipe = WanVideoAutoregressivePipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device=accelerator.device,
@@ -94,19 +88,17 @@ def main():
             print(f"✅ LoRA loaded: {lora_path}")
 
     # Output dir
-    output_dir = args.output_dir or f"output_videos/{args.lora_step}/{args.run_cate}"
+    output_dir = args.output_dir or f"output_videos/{args.lora_step}/{args.run_cate}/vbench_expand"
     os.makedirs(output_dir, exist_ok=True)
 
     # Process one-by-one
     for i, item in enumerate(local_items):
         prompt = item[args.prompt_type]
-        video_file = "clips_short_960/" + item["clip_id"]
         
-        try:
-            # Load input video
-            input_video = video_op(video_file)
-        except Exception as e:
-            accelerator.print(f"❌ [Rank {rank}] Failed to load video '{video_file}': {e}")
+        filename = f"{item['prompt']}.mp4"
+        save_path = os.path.join(output_dir, f"{item['prompt']}-0.mp4")
+        
+        if os.path.exists(save_path):
             continue
 
         try:
@@ -119,28 +111,24 @@ def main():
                 tiled=args.tiled,
                 # use_mllm_condition=args.use_mllm,
                 # mllm_neg_mode="full",
-                num_frames=((len(input_video) + 2) // 32) * 32 + 29
+                num_frames=93
             )
 
             # Safe filename: {video_stem}_{sanitized_prompt_head}_ori.mp4
-            stem = Path(video_file).stem
-            prompt_head = sanitize_filename(prompt[:60])  # First 60 chars, sanitized
-            filename = f"{stem}_ar.mp4"
-            save_path = os.path.join(output_dir, filename)
+
 
             # Avoid overwrite: add _1, _2, ... if exists
             counter = 1
-            orig_save_path = save_path
             while os.path.exists(save_path):
-                name, ext = os.path.splitext(orig_save_path)
-                save_path = f"{name}_{counter}{ext}"
+                name, ext = os.path.splitext(filename)
+                save_path = f"{output_dir}/{name}-{counter}{ext}"
                 counter += 1
 
             save_video(output_video, save_path, fps=args.fps, quality=args.quality)
             accelerator.print(f"✅ [Rank {rank}] Saved: {save_path}")
 
         except Exception as e:
-            accelerator.print(f"❌ [Rank {rank}] Error on item {i} (video: {video_file}): {e}")
+            accelerator.print(f"❌ [Rank {rank}] Error on item {i} (video: {item['prompt']}): {e}")
             continue
 
     accelerator.wait_for_everyone()

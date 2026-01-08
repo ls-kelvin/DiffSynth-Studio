@@ -1,4 +1,6 @@
-import os, json, torch, random
+import os, json, torch
+from datetime import datetime
+import hashlib
 from accelerate import Accelerator
 
 
@@ -34,7 +36,7 @@ class ModelLogger:
                 project=self.wandb_project,
                 name=self.wandb_run_name,
                 config=self.wandb_config,
-                id=f"{self.wandb_run_name}_{int(random.random()*1000)}"
+                id=f"{self.wandb_run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             )
             self.wandb_initialized = True
     
