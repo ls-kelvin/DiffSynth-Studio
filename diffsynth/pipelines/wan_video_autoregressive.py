@@ -263,6 +263,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         tiled: Optional[bool] = True,
         tile_size: Optional[tuple] = (30, 52),
         tile_stride: Optional[tuple] = (15, 26),
+        use_mllm_condition: Optional[bool] = True,
         progress_bar_cmd=tqdm,
     ):
         """
@@ -289,6 +290,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
             tiled: Use tiled VAE encoding/decoding
             tile_size: Tile size for VAE
             tile_stride: Tile stride for VAE
+            use_mllm_condition: Whether to use MLLM condition (default: True)
             progress_bar_cmd: Progress bar function
             
         Returns:
@@ -343,44 +345,45 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
             print(f"  MLLM context: {len(generated_video_frames)} frames from previous blocks")
             
             # Step 1: Encode MLLM condition for this block
-            self.load_models_to_device(["mllm_encoder"])
-            mllm_output = self.encode_mllm_for_block(
-                prompt=prompt,
-                generated_video_frames=generated_video_frames,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                current_block=block_idx,
-            )
-            
-            # Compute MLLM embeddings if available
             mllm_embeddings = None
-            mllm_mask = mllm_output["mllm_mask"]
-            if _DEBUG_COMPARE_MASKS:
-                hs = mllm_output.get("mllm_hidden_states")
-                pid = mllm_output.get("mllm_position_ids")
-                kv_len = mllm_output.get("mllm_kv_len")
-                print(
-                    f"[wan_video_ar] block={block_idx} mllm_hidden_states={None if hs is None else tuple(hs.shape)} "
-                    f"mllm_position_ids={None if pid is None else tuple(pid.shape)} "
-                    f"mllm_mask={None if mllm_mask is None else tuple(mllm_mask.shape)} mllm_kv_len={kv_len}"
+            if use_mllm_condition:
+                self.load_models_to_device(["mllm_encoder"])
+                mllm_output = self.encode_mllm_for_block(
+                    prompt=prompt,
+                    generated_video_frames=generated_video_frames,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    current_block=block_idx,
                 )
-                if mllm_mask is not None:
-                    vals = [int(mllm_mask[0, i].item()) for i in [0, min(1, mllm_mask.shape[1]-1), min(10, mllm_mask.shape[1]-1)]]
-                    print(f"[wan_video_ar] block={block_idx} mllm_mask samples (q=0/1/10)={vals}")
-            if (
-                mllm_output.get("mllm_hidden_states") is not None
-                and hasattr(self.dit, "has_mllm_input")
-                and self.dit.has_mllm_input
-            ):
-                self.load_models_to_device(self.in_iteration_models)
-                mllm_embeddings = self.dit.mllm_embedding(
-                    mllm_output["mllm_hidden_states"],
-                    position_ids=mllm_output["mllm_position_ids"],
-                    mllm_mask=mllm_mask,
-                )
+                
+                # Compute MLLM embeddings if available
+                mllm_mask = mllm_output["mllm_mask"]
                 if _DEBUG_COMPARE_MASKS:
-                    print(f"[wan_video_ar] block={block_idx} mllm_embeddings={tuple(mllm_embeddings.shape)}")
+                    hs = mllm_output.get("mllm_hidden_states")
+                    pid = mllm_output.get("mllm_position_ids")
+                    kv_len = mllm_output.get("mllm_kv_len")
+                    print(
+                        f"[wan_video_ar] block={block_idx} mllm_hidden_states={None if hs is None else tuple(hs.shape)} "
+                        f"mllm_position_ids={None if pid is None else tuple(pid.shape)} "
+                        f"mllm_mask={None if mllm_mask is None else tuple(mllm_mask.shape)} mllm_kv_len={kv_len}"
+                    )
+                    if mllm_mask is not None:
+                        vals = [int(mllm_mask[0, i].item()) for i in [0, min(1, mllm_mask.shape[1]-1), min(10, mllm_mask.shape[1]-1)]]
+                        print(f"[wan_video_ar] block={block_idx} mllm_mask samples (q=0/1/10)={vals}")
+                if (
+                    mllm_output.get("mllm_hidden_states") is not None
+                    and hasattr(self.dit, "has_mllm_input")
+                    and self.dit.has_mllm_input
+                ):
+                    self.load_models_to_device(self.in_iteration_models)
+                    mllm_embeddings = self.dit.mllm_embedding(
+                        mllm_output["mllm_hidden_states"],
+                        position_ids=mllm_output["mllm_position_ids"],
+                        mllm_mask=mllm_mask,
+                    )
+                    if _DEBUG_COMPARE_MASKS:
+                        print(f"[wan_video_ar] block={block_idx} mllm_embeddings={tuple(mllm_embeddings.shape)}")
             
             # Step 2: Denoise this block (only this block's latents)
             self.load_models_to_device(self.in_iteration_models)
