@@ -1,0 +1,296 @@
+import torch, os, argparse, accelerate, warnings
+from diffsynth.core import UnifiedDataset
+from diffsynth.core.data import WanVideoInterDataset
+from diffsynth.pipelines.wan_video_inter import WanVideoInterPipeline, ModelConfig
+from diffsynth.diffusion import *
+import random
+random.seed(42)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def print_trainable_params(model):
+    """Print total trainable parameters and LoRA parameters."""
+    trainable_params = 0
+    lora_params = 0
+    all_params = 0
+    trainable_params_dict = {}
+    
+    for name, param in model.named_parameters():
+        all_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+            trainable_params_dict[name] = param.numel()
+            if "lora" in name.lower():
+                lora_params += param.numel()
+    
+    print(f"\n{'='*60}")
+    print(f"Parameter Count Summary:")
+    print(f"  Total Parameters:     {all_params:,}")
+    print(f"  Trainable Parameters: {trainable_params:,}")
+    print(f"  LoRA Parameters:      {lora_params:,}")
+    print(f"  LoRA / Trainable:     {lora_params / trainable_params * 100:.2f}%" if trainable_params > 0 else "  LoRA / Trainable:     N/A")
+    print(f"{'='*60}\n")
+    
+    with open("trainable_params.txt", "w") as f:
+        for name, count in trainable_params_dict.items():
+            f.write(f"{name}: {count}\n")
+
+
+class WanMLLMInterTrainingModule(DiffusionTrainingModule):
+    def __init__(
+        self,
+        model_paths=None, model_id_with_origin_paths=None,
+        tokenizer_path=None,
+        trainable_models=None,
+        lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
+        preset_lora_path=None, preset_lora_model=None,
+        use_gradient_checkpointing=True,
+        use_gradient_checkpointing_offload=False,
+        extra_inputs=None,
+        fp8_models=None,
+        offload_models=None,
+        device="cpu",
+        task="sft",
+        max_timestep_boundary=1.0,
+        min_timestep_boundary=0.0,
+        use_mllm_condition=False,
+        mllm_processor_path=None,
+        cfg_drop=0.0,
+    ):
+        super().__init__()
+        if not use_gradient_checkpointing:
+            warnings.warn("Gradient checkpointing is detected as disabled. For MLLM training we enable it to avoid OOM.")
+            use_gradient_checkpointing = True
+        model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
+        tokenizer_config = ModelConfig(path=tokenizer_path)
+        mllm_processor_config = ModelConfig(path=mllm_processor_path)
+        self.pipe = WanVideoInterPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device=device,
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+            mllm_processor_config=mllm_processor_config,
+        )
+        self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
+        self.switch_pipe_to_training_mode(
+            self.pipe, trainable_models,
+            lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
+            preset_lora_path, preset_lora_model,
+            task=task,
+        )
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
+        self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
+        self.fp8_models = fp8_models
+        self.task = task
+        self.task_to_loss = {
+            "sft:data_process": lambda pipe, *args: args,
+            "direct_distill:data_process": lambda pipe, *args: args,
+            "sft": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
+            "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
+            "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
+            "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
+        }
+        self.max_timestep_boundary = max_timestep_boundary
+        self.min_timestep_boundary = min_timestep_boundary
+        self.use_mllm_condition = use_mllm_condition
+        self.cfg_drop = cfg_drop
+
+    def switch_pipe_to_training_mode(
+        self,
+        pipe,
+        trainable_models=None,
+        lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
+        preset_lora_path=None, preset_lora_model=None,
+        task="sft",
+    ):
+        super().switch_pipe_to_training_mode(
+            pipe,
+            trainable_models=trainable_models,
+            lora_base_model=lora_base_model,
+            lora_target_modules=lora_target_modules,
+            lora_rank=lora_rank,
+            lora_checkpoint=lora_checkpoint,
+            preset_lora_path=preset_lora_path,
+            preset_lora_model=preset_lora_model,
+            task=task,
+        )
+
+        def enable_mllm_params(dit_model):
+            enabled = []
+            if dit_model is None:
+                return enabled
+            for name, param in dit_model.named_parameters():
+                if any(key in name for key in ["mllm_embedding", "cross_attn2"]):
+                    param.requires_grad = True
+                    enabled.append(name)
+            if enabled:
+                dit_model.train()
+            return enabled
+
+        enabled_params = []
+        for model_name in ["dit", "dit2"]:
+            if hasattr(pipe, model_name):
+                enabled_params.extend(enable_mllm_params(getattr(pipe, model_name)))
+
+        if enabled_params:
+            print(f"Enabled full finetuning for {len(enabled_params)} MLLM parameters; other parts remain LoRA-only.")
+    
+    def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
+        for extra_input in extra_inputs:
+            if extra_input == "input_image":
+                inputs_shared["input_image"] = data["video"][0]
+            elif extra_input == "end_image":
+                inputs_shared["end_image"] = data["video"][-1]
+            else:
+                inputs_shared[extra_input] = data[extra_input]
+        return inputs_shared
+    
+    def get_pipeline_inputs(self, data):
+        prompt_list = data["prompt_list"]
+        if self.cfg_drop > 0 and random.random() < self.cfg_drop:
+            prompt_list = [""] * len(prompt_list)
+        
+        inputs_posi = {}
+        inputs_nega = {}
+        inputs_shared = {
+            "prompt_list": prompt_list,
+            "clip_frames": data["clip_frames"],
+            "input_video": data["video"],
+            "height": data["video"][0].size[1],
+            "width": data["video"][0].size[0],
+            "num_frames": len(data["video"]),
+            "cfg_scale": 1,
+            "tiled": False,
+            "rand_device": self.pipe.device,
+            "use_gradient_checkpointing": self.use_gradient_checkpointing,
+            "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
+            "cfg_merge": False,
+            "max_timestep_boundary": self.max_timestep_boundary,
+            "min_timestep_boundary": self.min_timestep_boundary,
+            "use_mllm_condition": self.use_mllm_condition,
+        }
+        inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
+        return inputs_shared, inputs_posi, inputs_nega
+    
+    def forward(self, data, inputs=None):
+        if inputs is None:
+            inputs = self.get_pipeline_inputs(data)
+        inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
+        for unit in self.pipe.units:
+            inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
+        loss = self.task_to_loss[self.task](self.pipe, *inputs)
+        return loss
+
+
+def wan_parser():
+    parser = argparse.ArgumentParser(description="Training script for interactive prompt Wan.")
+    parser = add_general_config(parser)
+    parser = add_video_size_config(parser)
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
+    parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary.")
+    parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary.")
+    parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
+    parser.add_argument("--use_mllm_condition", action="store_true", help="Enable MLLM conditioning.")
+    parser.add_argument("--mllm_processor_path", type=str, default=None, help="Path to the MLLM processor.")
+    parser.add_argument("--cfg_drop", type=float, default=0.0, help="CFG drop rate.")
+    parser.add_argument("--target_fps", type=int, default=16, help="Target FPS for pipeline clips.")
+    parser.add_argument("--source_fps", type=int, default=30, help="Source FPS for action_config annotations.")
+    return parser
+
+
+if __name__ == "__main__":
+    parser = wan_parser()
+    args = parser.parse_args()
+    accelerator = accelerate.Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
+    )
+    dataset = WanVideoInterDataset(
+        base_path=args.dataset_base_path,
+        metadata_path=args.dataset_metadata_path,
+        repeat=args.dataset_repeat,
+        data_file_keys=args.data_file_keys.split(","),
+        main_data_operator=UnifiedDataset.default_video_operator(
+            base_path=args.dataset_base_path,
+            max_pixels=args.max_pixels,
+            height=args.height,
+            width=args.width,
+            height_division_factor=16,
+            width_division_factor=16,
+            num_frames=args.num_frames,
+            time_division_factor=4,
+            time_division_remainder=1,
+            fps=args.target_fps,
+        ),
+        target_fps=args.target_fps,
+        source_fps=args.source_fps,
+        max_pixels=args.max_pixels,
+        height=args.height,
+        width=args.width,
+        height_division_factor=16,
+        width_division_factor=16,
+        time_division_factor=4,
+        time_division_remainder=1,
+        cfg_drop=args.cfg_drop,
+    )
+    model = WanMLLMInterTrainingModule(
+        model_paths=args.model_paths,
+        model_id_with_origin_paths=args.model_id_with_origin_paths,
+        tokenizer_path=args.tokenizer_path,
+        trainable_models=args.trainable_models,
+        lora_base_model=args.lora_base_model,
+        lora_target_modules=args.lora_target_modules,
+        lora_rank=args.lora_rank,
+        lora_checkpoint=args.lora_checkpoint,
+        preset_lora_path=args.preset_lora_path,
+        preset_lora_model=args.preset_lora_model,
+        use_gradient_checkpointing=args.use_gradient_checkpointing,
+        use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
+        extra_inputs=args.extra_inputs,
+        fp8_models=args.fp8_models,
+        offload_models=args.offload_models,
+        task=args.task,
+        device="cpu" if args.initialize_model_on_cpu else accelerator.device,
+        max_timestep_boundary=args.max_timestep_boundary,
+        min_timestep_boundary=args.min_timestep_boundary,
+        use_mllm_condition=args.use_mllm_condition,
+        mllm_processor_path=args.mllm_processor_path,
+        cfg_drop=args.cfg_drop,
+    )
+    if torch.distributed.get_rank() == 0:
+        print_trainable_params(model)
+    
+    wandb_config = {
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "num_epochs": args.num_epochs,
+        "batch_size": args.gradient_accumulation_steps,
+        "lora_rank": args.lora_rank,
+        "lora_target_modules": args.lora_target_modules,
+        "height": args.height,
+        "width": args.width,
+        "num_frames": args.num_frames,
+        "task": args.task,
+        "target_fps": args.target_fps,
+        "source_fps": args.source_fps,
+    } if args.use_wandb else None
+    
+    model_logger = ModelLogger(
+        args.output_path,
+        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_config=wandb_config,
+        max_checkpoints=args.max_checkpoints,
+    )
+    launcher_map = {
+        "sft:data_process": launch_data_process_task,
+        "direct_distill:data_process": launch_data_process_task,
+        "sft": launch_training_task,
+        "sft:train": launch_training_task,
+        "direct_distill": launch_training_task,
+        "direct_distill:train": launch_training_task,
+    }
+    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)

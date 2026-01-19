@@ -1,1 +1,1 @@
-from .unified_dataset import UnifiedDataset
+from .unified_dataset import UnifiedDataset, WanVideoInterDataset

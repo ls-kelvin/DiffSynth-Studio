@@ -119,3 +119,119 @@ class UnifiedDataset(torch.utils.data.Dataset):
             if data1[k] != data2[k]:
                 return False
         return True
+
+
+class WanVideoInterDataset(UnifiedDataset):
+    def __init__(
+        self,
+        base_path=None, metadata_path=None,
+        repeat=1,
+        data_file_keys=tuple(),
+        main_data_operator=lambda x: x,
+        special_operator_map=None,
+        cfg_drop=0.0,
+        target_fps=16,
+        source_fps=30,
+        max_pixels=1920*1080,
+        height=None,
+        width=None,
+        height_division_factor=16,
+        width_division_factor=16,
+        time_division_factor=4,
+        time_division_remainder=1,
+    ):
+        super().__init__(
+            base_path=base_path,
+            metadata_path=metadata_path,
+            repeat=repeat,
+            data_file_keys=data_file_keys,
+            main_data_operator=main_data_operator,
+            special_operator_map=special_operator_map,
+            cfg_drop=cfg_drop,
+        )
+        self.target_fps = target_fps
+        self.source_fps = source_fps
+        self.time_division_factor = time_division_factor
+        self.time_division_remainder = time_division_remainder
+        self.frame_processor = ImageCropAndResize(
+            height, width, max_pixels, height_division_factor, width_division_factor
+        )
+
+    def _resolve_path(self, path):
+        if self.base_path and not os.path.isabs(path):
+            return os.path.join(self.base_path, path)
+        return path
+
+    def _convert_frame_index(self, frame_idx):
+        return int(round(frame_idx * self.target_fps / self.source_fps))
+
+    def _round_clip_length(self, length, is_first):
+        if is_first:
+            k = int(round((length - 1) / 4))
+            if k < 0:
+                k = 0
+            return max(1, 4 * k + 1)
+        k = int(round(length / 4))
+        if k < 1:
+            k = 1
+        return max(4, 4 * k)
+
+    def _build_prompt_and_clips(self, data):
+        prompt_list = data["detailed_action_captions"]
+        action_config = data["input"]["label_info"]["action_config"]
+        count = min(len(prompt_list), len(action_config))
+        prompt_list = prompt_list[:count]
+        clip_frames = []
+        for idx in range(count):
+            cfg = action_config[idx]
+            start_frame = cfg["start_frame"]
+            end_frame = cfg["end_frame"]
+            if idx == 0:
+                start_frame = 0
+            start_t = self._convert_frame_index(start_frame)
+            end_t = self._convert_frame_index(end_frame)
+            if end_t <= start_t:
+                end_t = start_t + 1
+            clip_len = self._round_clip_length(end_t - start_t, is_first=(idx == 0))
+            clip_frames.append(clip_len)
+        return prompt_list, clip_frames
+
+    def _adjust_clip_frames(self, clip_frames, total_frames):
+        diff = total_frames - sum(clip_frames)
+        if diff == 0 or not clip_frames:
+            return clip_frames
+        clip_frames[-1] += diff
+        min_len = 1 if len(clip_frames) == 1 else 4
+        if clip_frames[-1] < min_len:
+            clip_frames[-1] = min_len
+        return clip_frames
+
+    def __getitem__(self, data_id):
+        if self.load_from_cache:
+            return super().__getitem__(data_id)
+
+        data = self.data[data_id % len(self.data)].copy()
+        if (
+            "input" in data
+            and isinstance(data["input"], dict)
+            and "path" in data["input"]
+            and "detailed_action_captions" in data
+        ):
+            prompt_list, clip_frames = self._build_prompt_and_clips(data)
+            video_path = self._resolve_path(data["input"]["path"])
+            desired_num_frames = sum(clip_frames)
+            video_loader = LoadVideo(
+                num_frames=desired_num_frames,
+                time_division_factor=self.time_division_factor,
+                time_division_remainder=self.time_division_remainder,
+                frame_processor=self.frame_processor,
+                fps=self.target_fps,
+            )
+            video = video_loader(video_path)
+            clip_frames = self._adjust_clip_frames(clip_frames, len(video))
+            data["video"] = video
+            data["prompt_list"] = prompt_list
+            data["clip_frames"] = clip_frames
+            return data
+
+        return super().__getitem__(data_id)
