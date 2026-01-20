@@ -233,6 +233,7 @@ if __name__ == "__main__":
         time_division_factor=4,
         time_division_remainder=1,
         cfg_drop=args.cfg_drop,
+        num_frames=args.num_frames
     )
     model = WanMLLMInterTrainingModule(
         model_paths=args.model_paths,

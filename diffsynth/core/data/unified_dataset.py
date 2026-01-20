@@ -143,6 +143,7 @@ class WanVideoInterDataset(UnifiedDataset):
         width_division_factor=16,
         time_division_factor=4,
         time_division_remainder=1,
+        num_frames=81,
     ):
         super().__init__(
             base_path=base_path,
@@ -160,6 +161,7 @@ class WanVideoInterDataset(UnifiedDataset):
         self.frame_processor = ImageCropAndResize(
             height, width, max_pixels, height_division_factor, width_division_factor
         )
+        self.max_num_frames = num_frames
 
     def _resolve_path(self, path):
         if self.base_path and not os.path.isabs(path):
@@ -210,6 +212,33 @@ class WanVideoInterDataset(UnifiedDataset):
             clip_frames[-1] = min_len
         return clip_frames
 
+    def _truncate_clips_to_max_frames(self, prompt_list, clip_frames, max_frames):
+        if max_frames is None or max_frames <= 0 or not clip_frames:
+            return prompt_list, clip_frames
+        if sum(clip_frames) <= max_frames:
+            return prompt_list, clip_frames
+
+        kept_prompts = []
+        kept_frames = []
+        total = 0
+        for prompt, frames in zip(prompt_list, clip_frames):
+            if total + frames > max_frames:
+                break
+            kept_prompts.append(prompt)
+            kept_frames.append(frames)
+            total += frames
+
+        if kept_frames:
+            return kept_prompts, kept_frames
+
+        # Fallback: keep the first clip but clamp its length to fit the cap.
+        limit = max(1, max_frames)
+        k = (limit - 1) // 4
+        first_len = max(1, 4 * k + 1)
+        if first_len > limit:
+            first_len = limit
+        return [prompt_list[0]], [first_len]
+
     def __getitem__(self, data_id):
         if self.load_from_cache:
             return super().__getitem__(data_id)
@@ -222,6 +251,10 @@ class WanVideoInterDataset(UnifiedDataset):
             and "detailed_action_captions" in data
         ):
             prompt_list, clip_frames = self._build_prompt_and_clips(data)
+            max_frames = self.max_num_frames
+            prompt_list, clip_frames = self._truncate_clips_to_max_frames(
+                prompt_list, clip_frames, max_frames
+            )
             video_path = self._resolve_path(data["input"]["path"])
             desired_num_frames = sum(clip_frames)
             video_loader = LoadVideo(
