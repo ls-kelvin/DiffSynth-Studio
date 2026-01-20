@@ -35,12 +35,13 @@ accelerate launch \
   --main_process_ip ${MASTER_ADDR} \
   --main_process_port ${MASTER_PORT} \
   --config_file examples/wanvideo/model_training/distributed_eval.yaml \
-  examples/wanvideo/model_training/train_mllm.py \
-  --dataset_base_path data/UltraVideo \
-  --dataset_metadata_path data/UltraVideo/detailed.jsonl \
+  examples/wanvideo/model_training/train_mllm_inter.py \
+  --dataset_base_path "" \
+  --dataset_metadata_path /root/workspace/zzt/VideoCaption/output/agirobot_result.jsonl \
   --height 480 \
-  --width 832 \
+  --width 640 \
   --num_frames 125 \
+  --target_fps 6 \
   --dataset_repeat 1 \
   --model_path '[
     [
@@ -54,10 +55,9 @@ accelerate launch \
   --mllm_processor_path "/root/workspace/zzt/models/Qwen/Qwen3-VL-4B-Instruct" \
   --learning_rate 1e-4 \
   --remove_prefix_in_ckpt "pipe.dit." \
-  --output_path "./models/train/UltraVideo_detailed" \
+  --output_path "./models/train2/agibot-alpha" \
   --task "sft:data_process" \
   --lora_base_model "dit" \
   --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
   --lora_rank 32 \
   --use_mllm_condition 
-

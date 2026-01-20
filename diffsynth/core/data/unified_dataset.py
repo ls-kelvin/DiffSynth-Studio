@@ -92,7 +92,11 @@ class UnifiedDataset(torch.utils.data.Dataset):
             data = self.cached_data[data_id % len(self.cached_data)]
             data = self.cached_data_operator(data)
             if random.random() < self.cfg_drop:
-                data[1]["context"] = torch.zeros_like(data[1]["context"])
+                if "context" in data[1]:
+                    data[1]["context"] = torch.zeros_like(data[1]["context"])
+                if "prompt_embeddings_map" in data[0]:
+                    for k, v in data[0]["prompt_embeddings_map"].items():
+                        data[0]["prompt_embeddings_map"][k] = torch.zeros_like(v)
         else:
             data = self.data[data_id % len(self.data)].copy()
             if "video" in data:
@@ -230,6 +234,7 @@ class WanVideoInterDataset(UnifiedDataset):
             video = video_loader(video_path)
             clip_frames = self._adjust_clip_frames(clip_frames, len(video))
             data["video"] = video
+            data["video_id"] = "-".join(data["input"]["path"].split("/")[-4:-2])
             data["prompt_list"] = prompt_list
             data["clip_frames"] = clip_frames
             return data

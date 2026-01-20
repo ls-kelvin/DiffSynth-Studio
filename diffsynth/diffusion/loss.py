@@ -9,9 +9,12 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
     timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
 
-    half_idx = len(pipe.scheduler.timesteps) // 2
-    clean_timestep_id = torch.randint(half_idx, len(pipe.scheduler.timesteps), (1,))
-    clean_timestep = pipe.scheduler.timesteps[clean_timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
+    if torch.rand(1) < 0.5:
+        half_idx = len(pipe.scheduler.timesteps) // 2
+        clean_timestep_id = torch.randint(half_idx, len(pipe.scheduler.timesteps), (1,))
+        clean_timestep = pipe.scheduler.timesteps[clean_timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
+    else:
+        clean_timestep = torch.zeros(1, dtype=pipe.torch_dtype, device=pipe.device)
     
     noise = torch.randn_like(inputs["input_latents"])
     inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)

@@ -149,7 +149,7 @@ class WanMLLMInterTrainingModule(DiffusionTrainingModule):
     def get_pipeline_inputs(self, data):
         prompt_list = data["prompt_list"]
         if self.cfg_drop > 0 and random.random() < self.cfg_drop:
-            prompt_list = [""] * len(prompt_list)
+            prompt_list = [" "] * len(prompt_list)
         
         inputs_posi = {}
         inputs_nega = {}

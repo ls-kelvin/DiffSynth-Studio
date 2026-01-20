@@ -19,13 +19,14 @@ def parse_args():
     parser.add_argument("--jsonl_path", type=str, default="/root/workspace/zzt/data/UltraVideo/valid_new.jsonl",
                         help="Path to JSONL file with fields: {'prompt': str, 'video_file': str}")
     parser.add_argument("--prompt_type", type=str, default="recaption")
-    parser.add_argument("--lora_step", type=int, default=48800)
-    parser.add_argument("--run_cate", type=str, default="local_vae")
+    parser.add_argument("--lora_step", type=int, default=66000)
+    parser.add_argument("--run_cate", type=str, default="mllm_seperate")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--quality", type=int, default=5)
-    parser.add_argument("--disable_mllm", action="store_false", help="Enable MLLM condition (default: True)")
+    parser.add_argument("--disable_mllm", action="store_true", help="Enable MLLM condition (default: True)")
+    parser.add_argument("--use_input_video", action="store_true", help="Enable MLLM condition (default: True)")
     parser.add_argument("--tiled", action="store_true")
     return parser.parse_args()
 
@@ -92,7 +93,9 @@ def main():
         pipe.load_lora(pipe.dit, lora_path, alpha=1.0)
         if rank == 0:
             print(f"✅ LoRA loaded: {lora_path}")
-
+            
+            
+    bench = args.jsonl_path.split("/")[-1].split('.')[0]
     # Output dir
     output_dir = args.output_dir or f"output_videos/{args.lora_step}/{args.run_cate}"
     os.makedirs(output_dir, exist_ok=True)
@@ -114,12 +117,13 @@ def main():
             output_video = pipe(
                 prompt=prompt,
                 negative_prompt=NEG_PROMPT,
-                # input_video=input_video,
+                input_video=input_video if args.use_input_video else None,
                 seed=args.seed,
                 tiled=args.tiled,
-                # use_mllm_condition=args.use_mllm,
+                use_mllm_condition=not args.disable_mllm,
                 # mllm_neg_mode="full",
-                num_frames=((len(input_video) + 2) // 32) * 32 + 29
+                num_frames=((len(input_video) + 2) // 32) * 32 + 29,
+                # num_frames=477
             )
 
             # Safe filename: {video_stem}_{sanitized_prompt_head}_ori.mp4

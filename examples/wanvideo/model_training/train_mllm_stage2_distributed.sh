@@ -32,8 +32,8 @@ accelerate launch \
   --main_process_ip ${MASTER_ADDR} \
   --main_process_port ${MASTER_PORT} \
   --config_file examples/wanvideo/model_training/distributed.yaml \
-  examples/wanvideo/model_training/train_mllm.py \
-  --dataset_base_path "/root/workspace/zzt/DiffSynth-Studio/models/train/UltraVideo_detailed" \
+  examples/wanvideo/model_training/train_mllm_inter.py \
+  --dataset_base_path "./models/train2/agibot-alpha" \
   --dataset_repeat 1 \
   --model_path '[
     "/root/workspace/zzt/models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
@@ -43,15 +43,15 @@ accelerate launch \
   --learning_rate 1e-5 \
   --gradient_accumulation_steps 4 \
   --remove_prefix_in_ckpt "pipe.dit." \
-  --output_path "./models/train/Wan2.1-T2V-1.3B_lora_ultravideo_mllm_test" \
+  --output_path "./models/train2/Wan2.1-T2V-1.3B_lora_agibot-alpha_mllm" \
   --task "sft:train" \
   --lora_base_model "dit" \
-  --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
+  --lora_target_modules "self_attn.q,self_attn.k,self_attn.v,self_attn.o,cross_attn.q,cross_attn.k,cross_attn.v,cross_attn.o,ffn.0,ffn.2" \
   --lora_rank 64 \
   --use_mllm_condition \
   --num_epochs 100 \
   --use_wandb \
   --wandb_project "SSD" \
-  --wandb_run_name "wan2.1-1.3b-t2v-ultravideo" \
+  --wandb_run_name "wan2.1-1.3b-t2v_agibot-alpha_mllm" \
   --save_steps 800 \
   --cfg_drop 0.1
