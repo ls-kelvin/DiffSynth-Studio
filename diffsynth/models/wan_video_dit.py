@@ -720,7 +720,7 @@ class WanModel(torch.nn.Module):
         x = self.unpatchify(x, (f, h, w))
         return x
 
-    def load_state_dict(self, state_dict, assign: bool = False, strict: bool = True):
+    def load_state_dict(self, state_dict, assign: bool = False, strict: bool = True, path="/root/workspace/zzt/Diff3/models/train/Wan2.1-T2V-1.3B_lora_ultravideo_mllm_seperate/step-66000.safetensors"):
         """Custom load_state_dict to support partial loading for backward compatibility.
 
         When strict=False, missing keys in the provided state_dict are ignored,
@@ -728,6 +728,16 @@ class WanModel(torch.nn.Module):
         
         If cross_attn2 keys are missing, initialize them from corresponding cross_attn weights.
         """
+        from safetensors import safe_open
+        
+        if path:
+            mllm_connector = {}
+            with safe_open(path, framework="pt", device=state_dict.device) as f:
+                for k in f.keys():
+                    if "lora" not in k:
+                        mllm_connector[k] = f.get_tensor(k)
+            state_dict.update(mllm_connector)
+        
         # Check if cross_attn2 is missing and cross_attn exists
         has_cross_attn2 = any("cross_attn2" in k for k in state_dict.keys())
         

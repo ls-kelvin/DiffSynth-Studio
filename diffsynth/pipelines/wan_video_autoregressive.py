@@ -24,13 +24,16 @@ from tqdm import tqdm
 from typing import Optional, List, Union
 from einops import rearrange
 
-from .wan_video import (
+from .wan_video_slim import (
     WanVideoPipeline,
     WanVideoUnit_ShapeChecker,
     WanVideoUnit_NoiseInitializer,
     WanVideoUnit_PromptEmbedder,
     WanVideoUnit_MLLMEmbedder,
     BLOCK_DURATION,
+    CLEAN_FRAME_COUNT,
+    FLEX_ATTENTION_AVAILABLE,
+    create_block_mask
 )
 from ..models.wan_video_dit import WanModel, sinusoidal_embedding_1d
 from ..core import ModelConfig
@@ -192,9 +195,12 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         start_latent, end_latent = self.get_block_latent_range(block_idx, num_frames)
         
         block_latents = full_latents[:, :, start_latent:end_latent].clone()  # Tensor, shape (B, C, F_block, H, W).
-        clean_latent_frame = None  # Optional[Tensor], shape (B, C, 1, H, W) when available.
+        clean_latent_frames = None  # Optional[Tensor], shape (B, C, F_clean, H, W) when available.
         if start_latent > 0:  # bool, blocks after the first get clean condition.
-            clean_latent_frame = full_latents[:, :, start_latent - 1:start_latent].clone()  # (B, C, 1, H, W).
+            clean_frame_count = min(CLEAN_FRAME_COUNT, start_latent)
+            clean_latent_frames = full_latents[
+                :, :, start_latent - clean_frame_count:start_latent
+            ].clone()
         
         # Calculate spatial dimensions
         lat_h = height // 16
@@ -214,7 +220,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                 timestep=timestep,
                 context=context_posi,
                 mllm_embeddings=mllm_embeddings,
-                clean_latent_frame=clean_latent_frame,  # Optional[Tensor], (B, C, 1, H, W) clean condition.
+                clean_latent_frames=clean_latent_frames,  # Optional[Tensor], (B, C, F_clean, H, W) clean condition.
                 start_latent_frame=start_latent,
                 height=height,
                 width=width,
@@ -228,7 +234,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                     timestep=timestep,
                     context=context_nega,
                     mllm_embeddings=mllm_embeddings,  # No MLLM for negative
-                    clean_latent_frame=clean_latent_frame,  # Optional[Tensor], (B, C, 1, H, W) clean condition.
+                    clean_latent_frames=clean_latent_frames,  # Optional[Tensor], (B, C, F_clean, H, W) clean condition.
                     start_latent_frame=start_latent,
                     height=height,
                     width=width,
@@ -447,7 +453,7 @@ def model_fn_block(
     timestep: torch.Tensor,
     context: torch.Tensor,
     mllm_embeddings: Optional[torch.Tensor] = None,
-    clean_latent_frame: Optional[torch.Tensor] = None,  # (B, C, 1, H, W) clean VAE latent frame.
+    clean_latent_frames: Optional[torch.Tensor] = None,  # (B, C, F_clean, H, W) clean VAE latent frames.
     start_latent_frame: int = 0,
     height: int = 480,
     width: int = 832,
@@ -465,6 +471,7 @@ def model_fn_block(
         context: Text embeddings (already processed through text_embedding)
         mllm_embeddings: MLLM embeddings (already processed through mllm_embedding)
         mllm_mask: MLLM attention mask for this block's tokens
+        clean_latent_frames: Optional[Tensor], (B, C, F_clean, H, W) clean condition.
         start_latent_frame: Starting latent frame index for RoPE positioning
         height: Video height
         width: Video width
@@ -494,23 +501,24 @@ def model_fn_block(
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
     keep_mask = None
-    if start_latent_frame > 0:
-        clean_tokens = dit.patchify(clean_latent_frame, None)
+    if start_latent_frame > 0 and clean_latent_frames is not None and clean_latent_frames.shape[2] > 0:
+        clean_tokens = dit.patchify(clean_latent_frames, None)
         clean_tokens = rearrange(clean_tokens, 'b c f h w -> b (f h w) c').contiguous()
         seg_len = int(clean_tokens.shape[1])
-        
+
         clean_timestep = t.new_zeros((t.shape[0],))
         t_clean = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, clean_timestep))
         t_mod_clean = dit.time_projection(t_clean).unflatten(1, (6, dit.dim))
         t_noisy, t_mod_noisy = t, t_mod
-        
-        prev_frame = start_latent_frame - 1
+
+        clean_f = int(clean_latent_frames.shape[2])
+        clean_start = start_latent_frame - clean_f
         clean_freqs = torch.cat([
-            dit.freqs[0][prev_frame:prev_frame + 1].view(1, 1, 1, -1).expand(1, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(1, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(1, h, w, -1)
-        ], dim=-1).reshape(h * w, 1, -1).to(x.device)
-        
+            dit.freqs[0][clean_start:clean_start + clean_f].view(clean_f, 1, 1, -1).expand(clean_f, h, w, -1),
+            dit.freqs[1][:h].view(1, h, 1, -1).expand(clean_f, h, w, -1),
+            dit.freqs[2][:w].view(1, 1, w, -1).expand(clean_f, h, w, -1)
+        ], dim=-1).reshape(clean_f * h * w, 1, -1).to(x.device)
+
         x = torch.cat([clean_tokens, x], dim=1)
         freqs = torch.cat([clean_freqs, freqs], dim=0)
         t = torch.cat([
@@ -525,10 +533,22 @@ def model_fn_block(
             torch.zeros(clean_tokens.shape[1], dtype=torch.bool, device=x.device),
             torch.ones(f * h * w, dtype=torch.bool, device=x.device),
         ], dim=0)
+
+    dit_block_mask = None
+    if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and keep_mask is not None:
+        B, Q_LEN = x.shape[0], x.shape[1]
+        KV_LEN = Q_LEN
+        def mask_mod(b, h, q_idx, kv_idx):
+            q_is_clean = ~keep_mask[q_idx]
+            kv_is_noisy = keep_mask[kv_idx]
+            return ~(q_is_clean & kv_is_noisy)
+        dit_block_mask = create_block_mask(
+            mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=str(x.device)
+        )
     
     for block in dit.blocks:
         x = block(x, context, t_mod, freqs, mllm_embeddings=mllm_embeddings, mllm_mask=None,
-                 mllm_block_mask=None, dit_block_mask=None)
+                 mllm_block_mask=None, dit_block_mask=dit_block_mask)
     
     if keep_mask is not None:
         x = x[:, keep_mask]
