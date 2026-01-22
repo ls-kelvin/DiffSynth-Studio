@@ -530,6 +530,7 @@ def compute_noise_pred_per_block(
     block_info: dict,
     x_full: torch.Tensor,
     input_latents: torch.Tensor,
+    clean_input_latents: torch.Tensor,
     freqs_full: torch.Tensor,
     context_per_block: dict,
     t: torch.Tensor,
@@ -559,12 +560,14 @@ def compute_noise_pred_per_block(
     block_ids = None
     mllm_mask_combined = None
     
-    if block_idx > 0 and clean_frame_count > 0 and input_latents is not None:
+    clean_latents_source = clean_input_latents if clean_input_latents is not None else input_latents
+
+    if block_idx > 0 and clean_frame_count > 0 and clean_latents_source is not None:
         prev_latent_end = latent_start
         prev_latent_start = max(0, prev_latent_end - clean_frame_count)
         actual_clean_count = prev_latent_end - prev_latent_start
         if actual_clean_count > 0:
-            clean_latents = input_latents[:, :, prev_latent_start:prev_latent_end, :, :]
+            clean_latents = clean_latents_source[:, :, prev_latent_start:prev_latent_end, :, :]
             clean_patched = dit.patchify(clean_latents)
             clean_tokens = rearrange(clean_patched, 'b c f h w -> b (f h w) c').contiguous()
             
@@ -713,6 +716,7 @@ def model_fn_wan_video_inter(
     mllm_vision_ranges: torch.Tensor,
     use_gradient_checkpointing: bool = False,
     clean_timestep: torch.Tensor = None,
+    clean_input_latents: torch.Tensor = None,
     **kwargs,
 ) -> torch.Tensor:
     context_per_prompt = {idx: dit.text_embedding(emb) for idx, emb in prompt_embeddings_map.items()}
@@ -760,6 +764,7 @@ def model_fn_wan_video_inter(
             block_info=block,
             x_full=x,
             input_latents=input_latents,
+            clean_input_latents=clean_input_latents,
             freqs_full=freqs,
             context_per_block=context_per_block,
             t=t,
