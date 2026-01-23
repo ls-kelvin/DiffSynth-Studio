@@ -26,7 +26,7 @@ except ImportError:
     create_block_mask = None
 
 BLOCK_DURATION = 2
-CLEAN_FRAME_COUNT = 2
+CLEAN_FRAME_COUNT = 1
 
 class WanVideoPipeline(BasePipeline):
 

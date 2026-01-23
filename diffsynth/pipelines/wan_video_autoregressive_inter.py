@@ -243,6 +243,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
         tokens_per_latent_frame: int,
         use_gradient_checkpointing: bool,
         cfg_scale: float,
+        clean_latents_source: Optional[torch.Tensor] = None,
         progress_bar_cmd=tqdm,
     ) -> torch.Tensor:
         latent_start = block["latent_start"]
@@ -263,13 +264,16 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
             t_clean = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, clean_timestep))
             t_mod_clean = dit.time_projection(t_clean).unflatten(1, (6, dit.dim))
 
+            # Use clean_latents_source if provided, otherwise use full_latents
+            clean_source = clean_latents_source if clean_latents_source is not None else full_latents
+
             noise_pred_posi = compute_noise_pred_per_block(
                 dit=dit,
                 block_idx=block["global_block_idx"],
                 block_info=block,
                 x_full=full_latents,
                 input_latents=None,
-                clean_input_latents=full_latents,
+                clean_input_latents=clean_source,
                 freqs_full=freqs_full,
                 context_per_block={block["global_block_idx"]: context_posi},
                 t=t,
@@ -292,7 +296,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                     block_info=block,
                     x_full=full_latents,
                     input_latents=None,
-                    clean_input_latents=full_latents,
+                    clean_input_latents=clean_source,
                     freqs_full=freqs_full,
                     context_per_block={block["global_block_idx"]: context_nega},
                     t=t,
@@ -393,6 +397,20 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
 
         generated_video_frames: List[Image.Image] = []
 
+        # Encode input_video to latents if provided
+        input_video_latents = None
+        if input_video is not None:
+            self.load_models_to_device(["vae"])
+            input_video_tensor = self.vae.video_to_vae_input(input_video)
+            input_video_latents = self.vae.encode(
+                input_video_tensor,
+                device=self.device,
+                tiled=tiled,
+                tile_size=tile_size,
+                tile_stride=tile_stride,
+            )
+            print(f"Encoded input_video to latents: {input_video_latents.shape}")
+
         for block in block_info:
             block_idx = block["global_block_idx"]
             start_frame = block["start_frame"]
@@ -452,6 +470,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                 tokens_per_latent_frame=tokens_per_latent_frame,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 cfg_scale=cfg_scale,
+                clean_latents_source=input_video_latents,
                 progress_bar_cmd=progress_bar_cmd,
             )
 

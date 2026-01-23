@@ -21,7 +21,7 @@ except ImportError:
     FLEX_ATTENTION_AVAILABLE = False
     create_block_mask = None
 
-BLOCK_DURATION = 2
+BLOCK_DURATION = 5
 CLEAN_FRAME_COUNT = 2
 
 

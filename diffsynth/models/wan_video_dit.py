@@ -720,7 +720,7 @@ class WanModel(torch.nn.Module):
         x = self.unpatchify(x, (f, h, w))
         return x
 
-    def load_state_dict(self, state_dict, assign: bool = False, strict: bool = True, path="/root/workspace/zzt/Diff3/models/train/Wan2.1-T2V-1.3B_lora_ultravideo_mllm_seperate/step-66000.safetensors"):
+    def load_state_dict(self, state_dict, assign: bool = False, strict: bool = True, path=None):
         """Custom load_state_dict to support partial loading for backward compatibility.
 
         When strict=False, missing keys in the provided state_dict are ignored,

@@ -185,6 +185,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         height: int,
         width: int,
         num_frames: int,
+        clean_latents_source: Optional[torch.Tensor] = None,
         progress_bar_cmd=tqdm,
     ) -> torch.Tensor:
         """
@@ -198,9 +199,14 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         clean_latent_frames = None  # Optional[Tensor], shape (B, C, F_clean, H, W) when available.
         if start_latent > 0:  # bool, blocks after the first get clean condition.
             clean_frame_count = min(CLEAN_FRAME_COUNT, start_latent)
-            clean_latent_frames = full_latents[
-                :, :, start_latent - clean_frame_count:start_latent
-            ].clone()
+            if clean_latents_source is not None:
+                clean_latent_frames = clean_latents_source[
+                    :, :, start_latent - clean_frame_count:start_latent
+                ].clone()
+            else:
+                clean_latent_frames = full_latents[
+                    :, :, start_latent - clean_frame_count:start_latent
+                ].clone()
         
         # Calculate spatial dimensions
         lat_h = height // 16
@@ -340,6 +346,20 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         # Accumulated video frames for MLLM conditioning (generated or input)
         generated_video_frames: List[Image.Image] = []
         
+        # Encode input_video to latents if provided
+        input_video_latents = None
+        if input_video is not None:
+            self.load_models_to_device(['vae'])
+            input_video_tensor = self.vae.video_to_vae_input(input_video)
+            input_video_latents = self.vae.encode(
+                input_video_tensor,
+                device=self.device,
+                tiled=tiled,
+                tile_size=tile_size,
+                tile_stride=tile_stride
+            )
+            print(f"Encoded input_video to latents: {input_video_latents.shape}")
+        
         # Process each block sequentially
         for block_idx in range(num_blocks):
             start_latent, end_latent = self.get_block_latent_range(block_idx, num_frames)
@@ -405,6 +425,7 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
                 height=height,
                 width=width,
                 num_frames=num_frames,
+                clean_latents_source=input_video_latents,
                 progress_bar_cmd=progress_bar_cmd,
             )
             
@@ -535,16 +556,16 @@ def model_fn_block(
         ], dim=0)
 
     dit_block_mask = None
-    if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and keep_mask is not None:
-        B, Q_LEN = x.shape[0], x.shape[1]
-        KV_LEN = Q_LEN
-        def mask_mod(b, h, q_idx, kv_idx):
-            q_is_clean = ~keep_mask[q_idx]
-            kv_is_noisy = keep_mask[kv_idx]
-            return ~(q_is_clean & kv_is_noisy)
-        dit_block_mask = create_block_mask(
-            mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=str(x.device)
-        )
+    # if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and keep_mask is not None:
+    #     B, Q_LEN = x.shape[0], x.shape[1]
+    #     KV_LEN = Q_LEN
+    #     def mask_mod(b, h, q_idx, kv_idx):
+    #         q_is_clean = ~keep_mask[q_idx]
+    #         kv_is_noisy = keep_mask[kv_idx]
+    #         return ~(q_is_clean & kv_is_noisy)
+    #     dit_block_mask = create_block_mask(
+    #         mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=str(x.device)
+    #     )
     
     for block in dit.blocks:
         x = block(x, context, t_mod, freqs, mllm_embeddings=mllm_embeddings, mllm_mask=None,
