@@ -132,7 +132,7 @@ def main():
                 tiled=args.tiled,
             )
 
-            video_id = item.get("video_id") or f"sample_{idx}"
+            video_id = item["video_id"]
             filename = f"{video_id}_ar_inter.mp4"
             save_path = os.path.join(output_dir, filename)
 

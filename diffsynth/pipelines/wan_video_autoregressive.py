@@ -350,14 +350,14 @@ class WanVideoAutoregressivePipeline(WanVideoPipeline):
         input_video_latents = None
         if input_video is not None:
             self.load_models_to_device(['vae'])
-            input_video_tensor = self.vae.video_to_vae_input(input_video)
+            input_video_tensor = self.preprocess_video(input_video)
             input_video_latents = self.vae.encode(
                 input_video_tensor,
                 device=self.device,
                 tiled=tiled,
                 tile_size=tile_size,
                 tile_stride=tile_stride
-            )
+            ).to(dtype=self.torch_dtype, device=self.device)
             print(f"Encoded input_video to latents: {input_video_latents.shape}")
         
         # Process each block sequentially
