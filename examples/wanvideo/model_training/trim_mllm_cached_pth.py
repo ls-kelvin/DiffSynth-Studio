@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import multiprocessing as mp
 import os
 from typing import Iterable, Tuple
 
 import torch
+from tqdm import tqdm
 
 from diffsynth.pipelines.wan_video_inter import WanVideoUnit_BlockScheduler
 
@@ -33,8 +35,17 @@ def cap_clip_frames(
             break
         new_clip_frames.append(int(frames))
         total += int(frames)
-    new_prompt_list = prompt_list[:len(new_clip_frames)]
-    return new_prompt_list, new_clip_frames
+    if new_clip_frames:
+        new_prompt_list = prompt_list[:len(new_clip_frames)]
+        return new_prompt_list, new_clip_frames
+
+    # Fallback: keep the first clip but clamp its length to fit the cap.
+    limit = max(1, max_frames)
+    k = (limit - 1) // 4
+    first_len = max(1, 4 * k + 1)
+    if first_len > limit:
+        first_len = limit
+    return [prompt_list[0]], [first_len]
 
 
 def trim_latents(input_latents, num_latent_frames: int):
@@ -134,6 +145,24 @@ def process_cached_data(data, max_frames: int):
     return inputs_shared, True
 
 
+def _process_file(in_path: str, out_path: str, max_frames: int, dry_run: bool, skip_existing: bool):
+    try:
+        if skip_existing and os.path.exists(out_path):
+            return in_path, out_path, "exists"
+        data = torch.load(in_path, map_location="cpu", weights_only=False)
+        new_data, _ = process_cached_data(data, max_frames)
+        if not dry_run:
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            torch.save(new_data, out_path)
+        return in_path, out_path, None
+    except Exception as exc:
+        return in_path, out_path, str(exc)
+
+
+def _process_file_args(args_tuple):
+    return _process_file(*args_tuple)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Trim cached Wan MLLM .pth files to a max num_frames without re-encoding."
@@ -160,6 +189,17 @@ def main():
         action="store_true",
         help="Show which files would be processed without writing output.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers (defaults to CPU count).",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip writing if output file already exists.",
+    )
     args = parser.parse_args()
 
     if args.num_frames <= 0:
@@ -168,28 +208,33 @@ def main():
     abs_inputs = [os.path.abspath(p) for p in args.paths]
     base_dir = os.path.commonpath(abs_inputs)
 
+    inputs = []
     for in_path in iter_pth_files(args.paths):
         out_path = in_path
         if args.output_dir is not None:
             rel = os.path.relpath(os.path.abspath(in_path), start=base_dir)
             out_path = os.path.join(args.output_dir, rel)
+        inputs.append((in_path, out_path))
 
-        data = torch.load(in_path, map_location="cpu", weights_only=False)
-        try:
-            new_data, changed = process_cached_data(data, args.num_frames)
-        except Exception as exc:
-            print(f"[skip] {in_path}: {exc}")
-            continue
+    if not inputs:
+        print("No .pth files found.")
+        return
 
-        if not changed:
-            print(f"[skip] {in_path}: num_frames already <= cap")
-            continue
-
-        print(f"[write] {in_path} -> {out_path}")
-        if args.dry_run:
-            continue
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        torch.save(new_data, out_path)
+    worker_count = args.workers or os.cpu_count() or 1
+    worker_count = max(1, int(worker_count))
+    with mp.Pool(processes=worker_count) as pool:
+        iterator = pool.imap_unordered(
+            _process_file_args,
+            [(p, o, args.num_frames, args.dry_run, args.skip_existing) for p, o in inputs],
+        )
+        for in_path, out_path, err in tqdm(iterator, total=len(inputs), ncols=120):
+            if err:
+                if err == "exists":
+                    print(f"[skip] {in_path}: output exists")
+                else:
+                    print(f"[skip] {in_path}: {err}")
+                continue
+            print(f"[write] {in_path} -> {out_path}")
 
 
 if __name__ == "__main__":
