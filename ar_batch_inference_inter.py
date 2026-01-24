@@ -29,7 +29,8 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--quality", type=int, default=5)
     parser.add_argument("--disable_mllm", action="store_true", help="Disable MLLM condition (default: False)")
-    parser.add_argument("--use_input_video", action="store_true", help="Use input video as MLLM context")
+    parser.add_argument("--use_gt_mllm", action="store_true", help="Use input_video for MLLM context")
+    parser.add_argument("--use_gt_vae", action="store_true", help="Use input_video for VAE clean latents")
     parser.add_argument("--tiled", action="store_true")
     parser.add_argument("--cfg_scale", type=float, default=5.0)
     parser.add_argument("--num_inference_steps", type=int, default=50)
@@ -120,12 +121,14 @@ def main():
                 prompt_list=prompt_list,
                 negative_prompt_list=negative_prompt_list,
                 clip_frames=clip_frames,
-                input_video=input_video if args.use_input_video else None,
+                input_video=input_video if (args.use_gt_mllm or args.use_gt_vae) else None,
                 seed=args.seed,
                 height=height,
                 width=width,
                 num_frames=num_frames,
                 use_mllm_condition=not args.disable_mllm,
+                use_gt_mllm=args.use_gt_mllm,
+                use_gt_vae=args.use_gt_vae,
                 cfg_scale=args.cfg_scale,
                 num_inference_steps=args.num_inference_steps,
                 sigma_shift=args.sigma_shift,

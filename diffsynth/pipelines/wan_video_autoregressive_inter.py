@@ -380,6 +380,8 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
         width: Optional[int] = 832,
         num_frames: int = 81,
         use_mllm_condition: Optional[bool] = True,
+        use_gt_mllm: bool = False,
+        use_gt_vae: bool = False,
         cfg_scale: Optional[float] = 5.0,
         num_inference_steps: Optional[int] = 50,
         sigma_shift: Optional[float] = 5.0,
@@ -440,9 +442,9 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
 
         generated_video_frames: List[Image.Image] = []
 
-        # Encode input_video to latents if provided
+        # Encode input_video to latents if requested
         input_video_latents = None
-        if input_video is not None:
+        if use_gt_vae and input_video is not None:
             self.load_models_to_device(["vae"])
             input_video_tensor = self.vae.video_to_vae_input(input_video)
             input_video_latents = self.vae.encode(
@@ -521,22 +523,22 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
             )
 
             if use_mllm_condition:
-                self.load_models_to_device(["vae"])
-                latents_to_decode = latents[:, :, :latent_end]
-                all_video = self.vae.decode(
-                    latents_to_decode,
-                    device=self.device,
-                    tiled=tiled,
-                    tile_size=tile_size,
-                    tile_stride=tile_stride,
-                )
-                all_video_frames = self.vae_output_to_video(all_video)
-
-                if input_video is not None:
+                if use_gt_mllm and input_video is not None:
                     generated_video_frames = input_video[:end_frame]
+                    print(f"  Using input_video frames up to block {block_idx}")
                 else:
+                    self.load_models_to_device(["vae"])
+                    latents_to_decode = latents[:, :, :latent_end]
+                    all_video = self.vae.decode(
+                        latents_to_decode,
+                        device=self.device,
+                        tiled=tiled,
+                        tile_size=tile_size,
+                        tile_stride=tile_stride,
+                    )
+                    all_video_frames = self.vae_output_to_video(all_video)
                     generated_video_frames = all_video_frames
-                print(f"  Decoded {len(all_video_frames)} frames up to block {block_idx}")
+                    print(f"  Decoded {len(all_video_frames)} frames up to block {block_idx}")
 
         print("\n=== Final Decoding ===")
         self.load_models_to_device(["vae"])
