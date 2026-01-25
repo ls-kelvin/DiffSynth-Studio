@@ -446,7 +446,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
         input_video_latents = None
         if use_gt_vae and input_video is not None:
             self.load_models_to_device(["vae"])
-            input_video_tensor = self.vae.video_to_vae_input(input_video)
+            input_video_tensor = self.preprocess_video(input_video)
             input_video_latents = self.vae.encode(
                 input_video_tensor,
                 device=self.device,

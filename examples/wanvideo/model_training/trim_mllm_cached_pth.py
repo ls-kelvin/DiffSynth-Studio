@@ -35,17 +35,8 @@ def cap_clip_frames(
             break
         new_clip_frames.append(int(frames))
         total += int(frames)
-    if new_clip_frames:
-        new_prompt_list = prompt_list[:len(new_clip_frames)]
-        return new_prompt_list, new_clip_frames
-
-    # Fallback: keep the first clip but clamp its length to fit the cap.
-    limit = max(1, max_frames)
-    k = (limit - 1) // 4
-    first_len = max(1, 4 * k + 1)
-    if first_len > limit:
-        first_len = limit
-    return [prompt_list[0]], [first_len]
+    new_prompt_list = prompt_list[:len(new_clip_frames)]
+    return new_prompt_list, new_clip_frames
 
 
 def trim_latents(input_latents, num_latent_frames: int):
@@ -145,10 +136,8 @@ def process_cached_data(data, max_frames: int):
     return inputs_shared, True
 
 
-def _process_file(in_path: str, out_path: str, max_frames: int, dry_run: bool, skip_existing: bool):
+def _process_file(in_path: str, out_path: str, max_frames: int, dry_run: bool):
     try:
-        if skip_existing and os.path.exists(out_path):
-            return in_path, out_path, "exists"
         data = torch.load(in_path, map_location="cpu", weights_only=False)
         new_data, _ = process_cached_data(data, max_frames)
         if not dry_run:
@@ -195,11 +184,6 @@ def main():
         default=None,
         help="Number of parallel workers (defaults to CPU count).",
     )
-    parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip writing if output file already exists.",
-    )
     args = parser.parse_args()
 
     if args.num_frames <= 0:
@@ -225,16 +209,13 @@ def main():
     with mp.Pool(processes=worker_count) as pool:
         iterator = pool.imap_unordered(
             _process_file_args,
-            [(p, o, args.num_frames, args.dry_run, args.skip_existing) for p, o in inputs],
+            [(p, o, args.num_frames, args.dry_run) for p, o in inputs],
         )
         for in_path, out_path, err in tqdm(iterator, total=len(inputs), ncols=120):
             if err:
-                if err == "exists":
-                    print(f"[skip] {in_path}: output exists")
-                else:
-                    print(f"[skip] {in_path}: {err}")
+                print(f"[skip] {in_path}: {err}")
                 continue
-            print(f"[write] {in_path} -> {out_path}")
+            # print(f"[write] {in_path} -> {out_path}")
 
 
 if __name__ == "__main__":
