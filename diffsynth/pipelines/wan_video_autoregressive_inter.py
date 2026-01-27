@@ -453,7 +453,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                 tiled=tiled,
                 tile_size=tile_size,
                 tile_stride=tile_stride,
-            )
+            ).to(dtype=self.torch_dtype, device=self.device)
             print(f"Encoded input_video to latents: {input_video_latents.shape}")
 
         for block in block_info:

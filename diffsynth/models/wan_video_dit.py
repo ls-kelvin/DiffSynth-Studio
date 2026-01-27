@@ -720,7 +720,7 @@ class WanModel(torch.nn.Module):
         x = self.unpatchify(x, (f, h, w))
         return x
 
-    def load_state_dict(self, state_dict, assign: bool = False, strict: bool = True, path=None):
+    def load_state_dict(self, state_dict, assign: bool = False, strict: bool = True, path="models/step-66000.safetensors"):
         """Custom load_state_dict to support partial loading for backward compatibility.
 
         When strict=False, missing keys in the provided state_dict are ignored,
@@ -730,7 +730,7 @@ class WanModel(torch.nn.Module):
         """
         from safetensors import safe_open
         
-        if path:
+        if path and not any("mllm_embedding" in k for k in state_dict.keys()):
             mllm_connector = {}
             with safe_open(path, framework="pt", device=state_dict.device) as f:
                 for k in f.keys():
