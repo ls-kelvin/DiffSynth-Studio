@@ -214,6 +214,7 @@ class CrossAttention(nn.Module):
         self,
         x: torch.Tensor,
         y: torch.Tensor,
+        block_mask: Optional[object] = None,
     ):
         if self.has_image_input:
             img = y[:, :257]
@@ -226,7 +227,14 @@ class CrossAttention(nn.Module):
         # T5 cross-attention
         k_t5 = self.norm_k(self.k(ctx))
         v_t5 = self.v(ctx)
-        x_t5 = self.attn(q, k_t5, v_t5)
+        if USE_FLEX_ATTENTION and (block_mask is not None):
+            q_h = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+            k_h = rearrange(k_t5, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+            v_h = rearrange(v_t5, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
+            x_t5 = _flex_attention_call(q_h, k_h, v_h, block_mask=block_mask)
+            x_t5 = rearrange(x_t5, "b n s d -> b s (n d)", n=self.num_heads)
+        else:
+            x_t5 = self.attn(q, k_t5, v_t5)
 
         x = x_t5
 
@@ -332,6 +340,7 @@ class DiTBlock(nn.Module):
         context,
         t_mod,
         freqs,
+        t5_block_mask: Optional[object] = None,
         mllm_embeddings: Optional[torch.Tensor] = None,
         mllm_mask: Optional[torch.Tensor] = None,
         mllm_block_mask: Optional[object] = None,
@@ -355,7 +364,7 @@ class DiTBlock(nn.Module):
 
         # x = x + self.cross_attn + self.cross_attn2 (cross_attn2 initialized to zero)
         norm_x = self.norm3(x)
-        x = x + self.cross_attn(norm_x, context)
+        x = x + self.cross_attn(norm_x, context, block_mask=t5_block_mask)
         if self.has_mllm_input and (mllm_embeddings is not None):
             x = x + self.cross_attn2(
                 norm_x,
@@ -694,24 +703,25 @@ class WanModel(torch.nn.Module):
                 device=str(x.device),
             )
 
+        t5_block_mask = None
         for block in self.blocks:
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
+                            x, context, t_mod, freqs, t5_block_mask, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
+                        x, context, t_mod, freqs, t5_block_mask, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                         use_reentrant=False,
                     )
             else:
                 x = block(
-                    x, context, t_mod, freqs,
+                    x, context, t_mod, freqs, t5_block_mask,
                     mllm_embeddings=mllm_embeddings,
                     mllm_mask=mllm_mask,
                     mllm_block_mask=mllm_block_mask,

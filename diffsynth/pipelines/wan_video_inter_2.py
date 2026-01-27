@@ -604,9 +604,7 @@ def compute_noise_pred_per_block(
             
             if mllm_mask_full is not None:
                 mllm_mask_noisy = mllm_mask_full[:, start_token_noisy:end_token_noisy]
-                # clean_prefix = mllm_mask_full[:, start_token_noisy:start_token_noisy + 1]
-                # mllm_mask_clean = clean_prefix.expand(mllm_mask_full.shape[0], num_clean_tokens)
-                mllm_mask_clean = torch.zeros((1, num_clean_tokens), device=device, dtype=mllm_mask_full.dtype)
+                mllm_mask_clean = mllm_mask_full.new_zeros((mllm_mask_full.shape[0], num_clean_tokens))
                 mllm_mask_combined = torch.cat([mllm_mask_clean, mllm_mask_noisy], dim=1)
             
             x_input = x_combined
@@ -651,6 +649,20 @@ def compute_noise_pred_per_block(
             mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
             device=str(device)
         )
+
+    t5_block_mask = None
+    if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and context is not None and keep_mask is not None:
+        B = x_input.shape[0]
+        Q_LEN = x_input.shape[1]
+        KV_LEN = context.shape[1]
+
+        def mask_mod_t5(b, h, q_idx, kv_idx):
+            return keep_mask[q_idx]
+
+        t5_block_mask = create_block_mask(
+            mask_mod_t5, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
+            device=str(device)
+        )
     
     dit_block_mask = None
     if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and \
@@ -680,13 +692,13 @@ def compute_noise_pred_per_block(
         if use_gradient_checkpointing:
             x_input = torch.utils.checkpoint.checkpoint(
                 create_custom_forward(dit_block),
-                x_input, context, t_mod_input, freqs_input,
+                x_input, context, t_mod_input, freqs_input, t5_block_mask,
                 mllm_embeddings, mllm_mask_input, mllm_block_mask, dit_block_mask,
                 use_reentrant=False,
             )
         else:
             x_input = dit_block(
-                x_input, context, t_mod_input, freqs_input,
+                x_input, context, t_mod_input, freqs_input, t5_block_mask,
                 mllm_embeddings=mllm_embeddings,
                 mllm_mask=mllm_mask_input,
                 mllm_block_mask=mllm_block_mask,
