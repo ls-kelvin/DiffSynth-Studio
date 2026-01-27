@@ -585,6 +585,8 @@ class WanModel(torch.nn.Module):
         else:
             self.control_adapter = None
 
+        self.init_load = 0
+
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
         x = self.patch_embedding(x)
         if self.control_adapter is not None and control_camera_latents_input is not None:
@@ -730,30 +732,33 @@ class WanModel(torch.nn.Module):
         """
         from safetensors import safe_open
         
-        if path and not any("mllm_embedding" in k for k in state_dict.keys()):
-            mllm_connector = {}
-            with safe_open(path, framework="pt", device=state_dict.device) as f:
-                for k in f.keys():
-                    if "lora" not in k:
-                        mllm_connector[k] = f.get_tensor(k)
-            state_dict.update(mllm_connector)
-        
-        # Check if cross_attn2 is missing and cross_attn exists
-        has_cross_attn2 = any("cross_attn2" in k for k in state_dict.keys())
-        
-        if not has_cross_attn2 and self.has_mllm_input:
-            # Initialize cross_attn2 from cross_attn for each block
-            new_keys = {}
-            for key, value in state_dict.items():
-                if ".cross_attn." in key:
-                    # Map cross_attn -> cross_attn2 (only for q, k, v, o, norm_q, norm_k)
-                    cross_attn2_key = key.replace(".cross_attn.", ".cross_attn2.")
-                    # Only copy q, k, v, o, norm_q, norm_k (not image-related)
-                    if any(sub in key for sub in [".q.", ".k.", ".v.", ".o.", ".norm_q.", ".norm_k."]):
-                        # Exclude image-related keys
-                        if not any(sub in key for sub in ["_img"]):
-                            new_keys[cross_attn2_key] = value.clone()
-            state_dict.update(new_keys)
+        if self.init_load == 0:
+            if path and not any("mllm_embedding" in k for k in state_dict.keys()):
+                mllm_connector = {}
+                with safe_open(path, framework="pt", device="cpu") as f:
+                    for k in f.keys():
+                        if "lora" not in k:
+                            mllm_connector[k] = f.get_tensor(k)
+                state_dict.update(mllm_connector)
+            
+            # Check if cross_attn2 is missing and cross_attn exists
+            has_cross_attn2 = any("cross_attn2" in k for k in state_dict.keys())
+            
+            if not has_cross_attn2 and self.has_mllm_input:
+                # Initialize cross_attn2 from cross_attn for each block
+                new_keys = {}
+                for key, value in state_dict.items():
+                    if ".cross_attn." in key:
+                        # Map cross_attn -> cross_attn2 (only for q, k, v, o, norm_q, norm_k)
+                        cross_attn2_key = key.replace(".cross_attn.", ".cross_attn2.")
+                        # Only copy q, k, v, o, norm_q, norm_k (not image-related)
+                        if any(sub in key for sub in [".q.", ".k.", ".v.", ".o.", ".norm_q.", ".norm_k."]):
+                            # Exclude image-related keys
+                            if not any(sub in key for sub in ["_img"]):
+                                new_keys[cross_attn2_key] = value.clone()
+                state_dict.update(new_keys)
+
+            self.init_load += 1
         
         # Simply delegate to parent with strict=False to allow missing keys
         return super().load_state_dict(state_dict, assign=assign, strict=False)
