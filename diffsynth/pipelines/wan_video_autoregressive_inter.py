@@ -382,6 +382,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
         use_mllm_condition: Optional[bool] = True,
         use_gt_mllm: bool = False,
         use_gt_vae: bool = False,
+        gt_decode: bool = True,
         cfg_scale: Optional[float] = 5.0,
         num_inference_steps: Optional[int] = 50,
         sigma_shift: Optional[float] = 5.0,
@@ -410,6 +411,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
         block_info = self._build_block_info(prompt_list, clip_frames, num_frames)
         num_blocks = len(block_info)
         num_dit_frames = 1 + (num_frames - 1) // 4
+        self.last_block_videos = []
 
         print("=== Autoregressive Inter Video Generation ===")
         print(f"Video: {width}x{height}, {num_frames} frames ({num_dit_frames} latent frames)")
@@ -521,6 +523,28 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                 clean_latents_source=input_video_latents,
                 progress_bar_cmd=progress_bar_cmd,
             )
+
+            if gt_decode and input_video_latents is not None:
+                gt_prefix = input_video_latents[:, :, :latent_start]
+                pred_suffix = latents[:, :, latent_start:latent_end]
+                latents_to_decode = torch.cat([gt_prefix, pred_suffix], dim=2)
+
+                self.load_models_to_device(["vae"])
+                merged_video = self.vae.decode(
+                    latents_to_decode,
+                    device=self.device,
+                    tiled=tiled,
+                    tile_size=tile_size,
+                    tile_stride=tile_stride,
+                )
+                merged_video_frames = self.vae_output_to_video(merged_video)
+                self.last_block_videos.append({
+                    "block_idx": block_idx,
+                    "prompt_idx": block["prompt_idx"],
+                    "end_frame": end_frame,
+                    "frames": merged_video_frames,
+                })
+                print(f"  Saved block-switch video for block {block_idx}")
 
             if use_mllm_condition:
                 if use_gt_mllm and input_video is not None:

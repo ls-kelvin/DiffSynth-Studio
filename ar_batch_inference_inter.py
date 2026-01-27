@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--disable_mllm", action="store_true", help="Disable MLLM condition (default: False)")
     parser.add_argument("--use_gt_mllm", action="store_true", help="Use input_video for MLLM context")
     parser.add_argument("--use_gt_vae", action="store_true", help="Use input_video for VAE clean latents")
+    parser.add_argument("--gt_decode", action=argparse.BooleanOptionalAction, default=True, help="Decode with GT prefix latents when saving prompt-switch videos")
     parser.add_argument("--tiled", action="store_true")
     parser.add_argument("--cfg_scale", type=float, default=5.0)
     parser.add_argument("--num_inference_steps", type=int, default=50)
@@ -129,6 +130,7 @@ def main():
                 use_mllm_condition=not args.disable_mllm,
                 use_gt_mllm=args.use_gt_mllm,
                 use_gt_vae=args.use_gt_vae,
+                gt_decode=args.gt_decode,
                 cfg_scale=args.cfg_scale,
                 num_inference_steps=args.num_inference_steps,
                 sigma_shift=args.sigma_shift,
@@ -148,6 +150,22 @@ def main():
 
             save_video(output_video, save_path, fps=args.fps, quality=args.quality)
             accelerator.print(f"✅ [Rank {rank}] Saved: {save_path}")
+
+            block_videos = getattr(pipe, "last_block_videos", [])
+            for block_video in block_videos:
+                block_idx = block_video["block_idx"]
+                prompt_idx = block_video["prompt_idx"]
+                frames = block_video["frames"]
+                block_filename = f"{video_id}_ar_inter_block{block_idx}_prompt{prompt_idx}.mp4"
+                block_save_path = os.path.join(output_dir, block_filename)
+                counter = 1
+                orig_block_save_path = block_save_path
+                while os.path.exists(block_save_path):
+                    name, ext = os.path.splitext(orig_block_save_path)
+                    block_save_path = f"{name}_{counter}{ext}"
+                    counter += 1
+                save_video(frames, block_save_path, fps=args.fps, quality=args.quality)
+                accelerator.print(f"✅ [Rank {rank}] Saved block-switch: {block_save_path}")
 
         except Exception as e:
             accelerator.print(f"❌ [Rank {rank}] Error on item {idx}: {e}")
