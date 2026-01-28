@@ -559,7 +559,6 @@ def compute_noise_pred_per_block(
     keep_mask = None
     block_ids = None
     mllm_mask_combined = None
-    cross_attn_q_mask = None
     
     clean_latents_source = clean_input_latents if clean_input_latents is not None else input_latents
 
@@ -580,7 +579,6 @@ def compute_noise_pred_per_block(
                 torch.zeros(num_clean_tokens, dtype=torch.bool, device=device),
                 torch.ones(num_noisy_tokens, dtype=torch.bool, device=device)
             ], dim=0)
-            cross_attn_q_mask = keep_mask.unsqueeze(0).expand(x_combined.shape[0], -1)
             block_ids = torch.cat([
                 torch.full((num_clean_tokens,), -1, dtype=torch.int32, device=device),
                 torch.full((num_noisy_tokens,), 0, dtype=torch.int32, device=device)
@@ -608,7 +606,6 @@ def compute_noise_pred_per_block(
                 mllm_mask_noisy = mllm_mask_full[:, start_token_noisy:end_token_noisy]
                 clean_prefix = mllm_mask_full[:, start_token_noisy:start_token_noisy + 1]
                 mllm_mask_clean = clean_prefix.expand(mllm_mask_full.shape[0], num_clean_tokens)
-                # mllm_mask_clean = torch.zeros((1, num_clean_tokens), device=device, dtype=mllm_mask_full.dtype)
                 mllm_mask_combined = torch.cat([mllm_mask_clean, mllm_mask_noisy], dim=1)
             
             x_input = x_combined
@@ -630,29 +627,29 @@ def compute_noise_pred_per_block(
         mllm_mask_input = mllm_mask_full[:, latent_start * tokens_per_latent_frame:latent_end * tokens_per_latent_frame] if mllm_mask_full is not None else None
 
     mllm_block_mask = None
-    if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and \
-       mllm_embeddings is not None and mllm_mask_input is not None and \
-       mllm_vision_ranges is not None:
-        start_token_global = latent_start * tokens_per_latent_frame
-        vision_range_start = mllm_vision_ranges[0, start_token_global, 0].item()
-        vision_range_end = mllm_vision_ranges[0, start_token_global, 1].item()
+    # if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and \
+    #    mllm_embeddings is not None and mllm_mask_input is not None and \
+    #    mllm_vision_ranges is not None:
+    #     start_token_global = latent_start * tokens_per_latent_frame
+    #     vision_range_start = mllm_vision_ranges[0, start_token_global, 0].item()
+    #     vision_range_end = mllm_vision_ranges[0, start_token_global, 1].item()
         
-        B = x_input.shape[0]
-        Q_LEN = x_input.shape[1]
-        KV_LEN = mllm_kv_len
+    #     B = x_input.shape[0]
+    #     Q_LEN = x_input.shape[1]
+    #     KV_LEN = mllm_kv_len
         
-        def mask_mod(b, h, q_idx, kv_idx):
-            in_vision_range = (kv_idx >= vision_range_start) & (kv_idx < vision_range_end)
-            if mllm_mask_combined is not None:
-                prefix_ok = kv_idx < mllm_mask_combined[b, q_idx]
-            else:
-                prefix_ok = kv_idx < mllm_mask_input[b, q_idx]
-            return in_vision_range & prefix_ok
+    #     def mask_mod(b, h, q_idx, kv_idx):
+    #         in_vision_range = (kv_idx >= vision_range_start) & (kv_idx < vision_range_end)
+    #         if mllm_mask_combined is not None:
+    #             prefix_ok = kv_idx < mllm_mask_combined[b, q_idx]
+    #         else:
+    #             prefix_ok = kv_idx < mllm_mask_input[b, q_idx]
+    #         return in_vision_range & prefix_ok
         
-        mllm_block_mask = create_block_mask(
-            mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
-            device=str(device)
-        )
+    #     mllm_block_mask = create_block_mask(
+    #         mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
+    #         device=str(device)
+    #     )
     
     dit_block_mask = None
     if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and \
@@ -683,7 +680,7 @@ def compute_noise_pred_per_block(
             x_input = torch.utils.checkpoint.checkpoint(
                 create_custom_forward(dit_block),
                 x_input, context, t_mod_input, freqs_input,
-                mllm_embeddings, mllm_mask_input, mllm_block_mask, dit_block_mask, cross_attn_q_mask,
+                mllm_embeddings, mllm_mask_input, mllm_block_mask, dit_block_mask,
                 use_reentrant=False,
             )
         else:
@@ -693,7 +690,6 @@ def compute_noise_pred_per_block(
                 mllm_mask=mllm_mask_input,
                 mllm_block_mask=mllm_block_mask,
                 dit_block_mask=dit_block_mask,
-                cross_attn_q_mask=cross_attn_q_mask,
             )
     
     x_output = dit.head(x_input, t_input if t_input.dim() == 3 else t_input)

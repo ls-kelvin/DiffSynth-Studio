@@ -214,7 +214,7 @@ class CrossAttention(nn.Module):
         self,
         x: torch.Tensor,
         y: torch.Tensor,
-        block_mask: Optional[object] = None,
+        q_mask: Optional[torch.Tensor] = None,
     ):
         if self.has_image_input:
             img = y[:, :257]
@@ -227,14 +227,7 @@ class CrossAttention(nn.Module):
         # T5 cross-attention
         k_t5 = self.norm_k(self.k(ctx))
         v_t5 = self.v(ctx)
-        if USE_FLEX_ATTENTION and (block_mask is not None):
-            q_h = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
-            k_h = rearrange(k_t5, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
-            v_h = rearrange(v_t5, "b s (n d) -> b n s d", n=self.num_heads).contiguous()
-            x_t5 = _flex_attention_call(q_h, k_h, v_h, block_mask=block_mask)
-            x_t5 = rearrange(x_t5, "b n s d -> b s (n d)", n=self.num_heads)
-        else:
-            x_t5 = self.attn(q, k_t5, v_t5)
+        x_t5 = self.attn(q, k_t5, v_t5)
 
         x = x_t5
 
@@ -245,7 +238,12 @@ class CrossAttention(nn.Module):
             y_img = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
             x = x + y_img
             
-        return self.o(x)
+        x = self.o(x)
+        if q_mask is not None:
+            if q_mask.ndim == 1:
+                q_mask = q_mask.unsqueeze(0)
+            x = x * q_mask.to(dtype=x.dtype, device=x.device).unsqueeze(-1)
+        return x
 
 
 class MLLMCrossAttention(nn.Module):
@@ -277,6 +275,7 @@ class MLLMCrossAttention(nn.Module):
         mllm_embeddings: torch.Tensor,
         mllm_mask: Optional[torch.Tensor] = None,
         mllm_block_mask: Optional[object] = None,
+        q_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(mllm_embeddings))
@@ -304,7 +303,12 @@ class MLLMCrossAttention(nn.Module):
         #     x_mllm = rearrange(x_mllm, "b n s d -> b s (n d)", n=self.num_heads)
 
         # Apply output projection and zero-initialized fusion
-        return self.fuse_linear(self.o(x_mllm))
+        x_mllm = self.fuse_linear(self.o(x_mllm))
+        if q_mask is not None:
+            if q_mask.ndim == 1:
+                q_mask = q_mask.unsqueeze(0)
+            x_mllm = x_mllm * q_mask.to(dtype=x_mllm.dtype, device=x_mllm.device).unsqueeze(-1)
+        return x_mllm
 
 class GateModule(nn.Module):
     def __init__(self,):
@@ -340,11 +344,11 @@ class DiTBlock(nn.Module):
         context,
         t_mod,
         freqs,
-        t5_block_mask: Optional[object] = None,
         mllm_embeddings: Optional[torch.Tensor] = None,
         mllm_mask: Optional[torch.Tensor] = None,
         mllm_block_mask: Optional[object] = None,
         dit_block_mask: Optional[object] = None,
+        cross_attn_q_mask: Optional[torch.Tensor] = None,
     ):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
@@ -364,13 +368,14 @@ class DiTBlock(nn.Module):
 
         # x = x + self.cross_attn + self.cross_attn2 (cross_attn2 initialized to zero)
         norm_x = self.norm3(x)
-        x = x + self.cross_attn(norm_x, context, block_mask=t5_block_mask)
+        x = x + self.cross_attn(norm_x, context, q_mask=cross_attn_q_mask)
         if self.has_mllm_input and (mllm_embeddings is not None):
             x = x + self.cross_attn2(
                 norm_x,
                 mllm_embeddings,
                 mllm_mask=mllm_mask,
                 mllm_block_mask=mllm_block_mask,
+                q_mask=cross_attn_q_mask,
             )
 
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -703,25 +708,24 @@ class WanModel(torch.nn.Module):
                 device=str(x.device),
             )
 
-        t5_block_mask = None
         for block in self.blocks:
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, t5_block_mask, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
+                            x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, t5_block_mask, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
+                        x, context, t_mod, freqs, mllm_embeddings, mllm_mask, mllm_block_mask, dit_block_mask,
                         use_reentrant=False,
                     )
             else:
                 x = block(
-                    x, context, t_mod, freqs, t5_block_mask,
+                    x, context, t_mod, freqs,
                     mllm_embeddings=mllm_embeddings,
                     mllm_mask=mllm_mask,
                     mllm_block_mask=mllm_block_mask,

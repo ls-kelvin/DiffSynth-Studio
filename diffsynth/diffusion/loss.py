@@ -29,7 +29,7 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
         **inputs,
         timestep=timestep,
         clean_timestep=torch.zeros(1, dtype=pipe.torch_dtype, device=pipe.device),
-        clean_input_latents=clean_input_latents,
+        # clean_input_latents=clean_input_latents,
     )
     
     loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
