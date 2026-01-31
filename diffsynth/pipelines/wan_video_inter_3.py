@@ -627,48 +627,48 @@ def compute_noise_pred_per_block(
         mllm_mask_input = mllm_mask_full[:, latent_start * tokens_per_latent_frame:latent_end * tokens_per_latent_frame] if mllm_mask_full is not None else None
 
     mllm_block_mask = None
-    # if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and \
-    #    mllm_embeddings is not None and mllm_mask_input is not None and \
-    #    mllm_vision_ranges is not None:
-    #     start_token_global = latent_start * tokens_per_latent_frame
-    #     vision_range_start = mllm_vision_ranges[0, start_token_global, 0].item()
-    #     vision_range_end = mllm_vision_ranges[0, start_token_global, 1].item()
-        
-    #     B = x_input.shape[0]
-    #     Q_LEN = x_input.shape[1]
-    #     KV_LEN = mllm_kv_len
-        
-    #     def mask_mod(b, h, q_idx, kv_idx):
-    #         in_vision_range = (kv_idx >= vision_range_start) & (kv_idx < vision_range_end)
-    #         if mllm_mask_combined is not None:
-    #             prefix_ok = kv_idx < mllm_mask_combined[b, q_idx]
-    #         else:
-    #             prefix_ok = kv_idx < mllm_mask_input[b, q_idx]
-    #         return in_vision_range & prefix_ok
-        
-    #     mllm_block_mask = create_block_mask(
-    #         mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
-    #         device=str(device)
-    #     )
-    
-    dit_block_mask = None
     if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and \
-       block_ids is not None and keep_mask is not None:
+       mllm_embeddings is not None and mllm_mask_input is not None and \
+       mllm_vision_ranges is not None:
+        start_token_global = latent_start * tokens_per_latent_frame
+        vision_range_start = mllm_vision_ranges[0, start_token_global, 0].item()
+        vision_range_end = mllm_vision_ranges[0, start_token_global, 1].item()
+        
         B = x_input.shape[0]
         Q_LEN = x_input.shape[1]
-        KV_LEN = Q_LEN
+        KV_LEN = mllm_kv_len
         
-        def mask_mod_dit(b, h, q_idx, kv_idx):
-            same_block = block_ids[q_idx] == block_ids[kv_idx]
-            q_is_clean = ~keep_mask[q_idx]
-            kv_is_noisy = keep_mask[kv_idx]
-            invalid_clean_look = q_is_clean & kv_is_noisy
-            return same_block & (~invalid_clean_look)
+        def mask_mod(b, h, q_idx, kv_idx):
+            in_vision_range = (kv_idx >= vision_range_start) & (kv_idx < vision_range_end)
+            if mllm_mask_combined is not None:
+                prefix_ok = kv_idx < mllm_mask_combined[b, q_idx]
+            else:
+                prefix_ok = kv_idx < mllm_mask_input[b, q_idx]
+            return in_vision_range & prefix_ok
         
-        dit_block_mask = create_block_mask(
-            mask_mod_dit, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
+        mllm_block_mask = create_block_mask(
+            mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
             device=str(device)
         )
+    
+    dit_block_mask = None
+    # if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and \
+    #    block_ids is not None and keep_mask is not None:
+    #     B = x_input.shape[0]
+    #     Q_LEN = x_input.shape[1]
+    #     KV_LEN = Q_LEN
+        
+    #     def mask_mod_dit(b, h, q_idx, kv_idx):
+    #         same_block = block_ids[q_idx] == block_ids[kv_idx]
+    #         q_is_clean = ~keep_mask[q_idx]
+    #         kv_is_noisy = keep_mask[kv_idx]
+    #         invalid_clean_look = q_is_clean & kv_is_noisy
+    #         return same_block & (~invalid_clean_look)
+        
+    #     dit_block_mask = create_block_mask(
+    #         mask_mod_dit, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
+    #         device=str(device)
+    #     )
     
     def create_custom_forward(module):
         def custom_forward(*inputs):
