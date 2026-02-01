@@ -55,7 +55,8 @@ class WanMLLMInterTrainingModule(DiffusionTrainingModule):
         min_timestep_boundary=0.0,
         use_mllm_condition=False,
         mllm_processor_path=None,
-        cfg_drop=0.0,
+        t5_cfg_drop=0.0,
+        mllm_cfg_drop=0.0,
     ):
         super().__init__()
         if not use_gradient_checkpointing:
@@ -94,7 +95,8 @@ class WanMLLMInterTrainingModule(DiffusionTrainingModule):
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
         self.use_mllm_condition = use_mllm_condition
-        self.cfg_drop = cfg_drop
+        self.t5_cfg_drop = t5_cfg_drop
+        self.mllm_cfg_drop = mllm_cfg_drop
 
     def switch_pipe_to_training_mode(
         self,
@@ -132,6 +134,12 @@ class WanMLLMInterTrainingModule(DiffusionTrainingModule):
         for model_name in ["dit", "dit2"]:
             if hasattr(pipe, model_name):
                 enabled_params.extend(enable_mllm_params(getattr(pipe, model_name)))
+            
+        if "mllm_encoder" in ([] if trainable_models is None else trainable_models.split(",")):
+            mllm_encoder = getattr(pipe, "mllm_encoder")
+            for param in mllm_encoder.model.visual.parameters():
+                param.requires_grad = False
+
 
         if enabled_params:
             print(f"Enabled full finetuning for {len(enabled_params)} MLLM parameters; other parts remain LoRA-only.")
@@ -148,8 +156,6 @@ class WanMLLMInterTrainingModule(DiffusionTrainingModule):
     
     def get_pipeline_inputs(self, data):
         prompt_list = data["prompt_list"]
-        if self.cfg_drop > 0 and random.random() < self.cfg_drop:
-            prompt_list = [" "] * len(prompt_list)
         
         inputs_posi = {}
         inputs_nega = {}
@@ -176,6 +182,8 @@ class WanMLLMInterTrainingModule(DiffusionTrainingModule):
     def forward(self, data, inputs=None):
         if inputs is None:
             inputs = self.get_pipeline_inputs(data)
+        inputs[0]["t5_cfg_drop"] = self.t5_cfg_drop
+        inputs[0]["mllm_cfg_drop"] = self.mllm_cfg_drop
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
@@ -193,7 +201,8 @@ def wan_parser():
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--use_mllm_condition", action="store_true", help="Enable MLLM conditioning.")
     parser.add_argument("--mllm_processor_path", type=str, default=None, help="Path to the MLLM processor.")
-    parser.add_argument("--cfg_drop", type=float, default=0.0, help="CFG drop rate.")
+    parser.add_argument("--t5_cfg_drop", type=float, default=0.0, help="T5 CFG drop rate (per block).")
+    parser.add_argument("--mllm_cfg_drop", type=float, default=0.0, help="MLLM CFG drop rate (per block).")
     parser.add_argument("--target_fps", type=int, default=16, help="Target FPS for pipeline clips.")
     parser.add_argument("--source_fps", type=int, default=30, help="Source FPS for action_config annotations.")
     return parser
@@ -232,7 +241,6 @@ if __name__ == "__main__":
         width_division_factor=16,
         time_division_factor=4,
         time_division_remainder=1,
-        cfg_drop=args.cfg_drop,
         num_frames=args.num_frames
     )
     model = WanMLLMInterTrainingModule(
@@ -257,7 +265,8 @@ if __name__ == "__main__":
         min_timestep_boundary=args.min_timestep_boundary,
         use_mllm_condition=args.use_mllm_condition,
         mllm_processor_path=args.mllm_processor_path,
-        cfg_drop=args.cfg_drop,
+        t5_cfg_drop=args.t5_cfg_drop,
+        mllm_cfg_drop=args.mllm_cfg_drop,
     )
     if torch.distributed.get_rank() == 0:
         print_trainable_params(model)

@@ -544,11 +544,21 @@ def compute_noise_pred_per_block(
     tokens_per_latent_frame: int,
     use_gradient_checkpointing: bool,
     device: torch.device,
+    mllm_cfg_drop: float = 0.0,
 ) -> torch.Tensor:
+    import random
+    
     latent_start = block_info["latent_start"]
     latent_end = block_info["latent_end"]
     
     context = context_per_block[block_idx]
+    
+    # Apply mllm_cfg_drop per block
+    if mllm_cfg_drop > 0 and random.random() < mllm_cfg_drop:
+        # Set mllm_embeddings to None for this block
+        mllm_embeddings_block = None
+    else:
+        mllm_embeddings_block = mllm_embeddings
     
     x_block = x_full[:, :, latent_start:latent_end, :, :]
     x_patched = dit.patchify(x_block)
@@ -680,13 +690,13 @@ def compute_noise_pred_per_block(
             x_input = torch.utils.checkpoint.checkpoint(
                 create_custom_forward(dit_block),
                 x_input, context, t_mod_input, freqs_input,
-                mllm_embeddings, mllm_mask_input, mllm_block_mask, dit_block_mask,
+                mllm_embeddings_block, mllm_mask_input, mllm_block_mask, dit_block_mask,
                 use_reentrant=False,
             )
         else:
             x_input = dit_block(
                 x_input, context, t_mod_input, freqs_input,
-                mllm_embeddings=mllm_embeddings,
+                mllm_embeddings=mllm_embeddings_block,
                 mllm_mask=mllm_mask_input,
                 mllm_block_mask=mllm_block_mask,
                 dit_block_mask=dit_block_mask,
@@ -717,14 +727,24 @@ def model_fn_wan_video_inter(
     use_gradient_checkpointing: bool = False,
     clean_timestep: torch.Tensor = None,
     clean_input_latents: torch.Tensor = None,
+    t5_cfg_drop: float = 0.0,
+    mllm_cfg_drop: float = 0.0,
     **kwargs,
 ) -> torch.Tensor:
+    import random
+    
     context_per_prompt = {idx: dit.text_embedding(emb) for idx, emb in prompt_embeddings_map.items()}
     context_per_block = {}
     for block in block_info:
         block_idx = block["global_block_idx"]
         prompt_idx = block["prompt_idx"]
-        context_per_block[block_idx] = context_per_prompt[prompt_idx]
+        
+        # Apply t5_cfg_drop per block
+        if t5_cfg_drop > 0 and random.random() < t5_cfg_drop:
+            # Zero out t5 embedding for this block
+            context_per_block[block_idx] = torch.zeros_like(context_per_prompt[prompt_idx])
+        else:
+            context_per_block[block_idx] = context_per_prompt[prompt_idx]
     
     if hasattr(dit, "has_mllm_input") and dit.has_mllm_input and mllm_hidden_states is not None:
         mllm_embeddings = dit.mllm_embedding(
@@ -778,6 +798,7 @@ def model_fn_wan_video_inter(
             tokens_per_latent_frame=tokens_per_latent_frame,
             use_gradient_checkpointing=use_gradient_checkpointing,
             device=x.device,
+            mllm_cfg_drop=mllm_cfg_drop,
         )
         noise_preds.append(noise_pred_block)
     

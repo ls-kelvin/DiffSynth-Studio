@@ -10,7 +10,6 @@ class UnifiedDataset(torch.utils.data.Dataset):
         data_file_keys=tuple(),
         main_data_operator=lambda x: x,
         special_operator_map=None,
-        cfg_drop=0.0,
     ):
         self.base_path = base_path
         self.metadata_path = metadata_path
@@ -22,7 +21,6 @@ class UnifiedDataset(torch.utils.data.Dataset):
         self.data = []
         self.cached_data = []
         self.load_from_cache = metadata_path is None
-        self.cfg_drop = cfg_drop
         self.load_metadata(metadata_path)
     
     @staticmethod
@@ -91,9 +89,6 @@ class UnifiedDataset(torch.utils.data.Dataset):
         if self.load_from_cache:
             data = self.cached_data[data_id % len(self.cached_data)]
             data = self.cached_data_operator(data)
-            if random.random() < self.cfg_drop:
-                if "context" in data[1]:
-                    data[1]["context"] = torch.zeros_like(data[1]["context"])
         else:
             data = self.data[data_id % len(self.data)].copy()
             if "video" in data:
@@ -130,7 +125,6 @@ class WanVideoInterDataset(UnifiedDataset):
         data_file_keys=tuple(),
         main_data_operator=lambda x: x,
         special_operator_map=None,
-        cfg_drop=0.0,
         target_fps=16,
         source_fps=30,
         max_pixels=1920*1080,
@@ -149,7 +143,6 @@ class WanVideoInterDataset(UnifiedDataset):
             data_file_keys=data_file_keys,
             main_data_operator=main_data_operator,
             special_operator_map=special_operator_map,
-            cfg_drop=cfg_drop,
         )
         self.target_fps = target_fps
         self.source_fps = source_fps
@@ -240,10 +233,6 @@ class WanVideoInterDataset(UnifiedDataset):
         if self.load_from_cache:
             data = self.cached_data[data_id % len(self.cached_data)]
             data = self.cached_data_operator(data)
-            if "prompt_embeddings_map" in data[0]:
-                for k, v in data[0]["prompt_embeddings_map"].items():
-                    if random.random() < self.cfg_drop:
-                        data[0]["prompt_embeddings_map"][k] = torch.zeros_like(v)
             return data
 
         data = self.data[data_id % len(self.data)].copy()

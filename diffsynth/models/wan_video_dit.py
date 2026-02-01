@@ -405,34 +405,49 @@ class MLP(torch.nn.Module):
 
 
 class Qwen3VLMllmEmbedding(nn.Module):
-    def __init__(self, out_dim: int, num_layers: int = 4):
+    def __init__(
+        self,
+        out_dim: int,
+        num_layers: int = 4,
+        has_transformer_blocks: bool = True,
+    ):
         super().__init__()
-        self.config = Qwen3VLTextConfig(
-            hidden_size=2560,
-            intermediate_size=9728,
-            num_hidden_layers=num_layers,
-            num_attention_heads=32,
-            num_key_value_heads=8,
-            head_dim=128,
-            hidden_act="silu",
-            rms_norm_eps=1e-6,
-            rope_theta=5000000,
-            max_position_embeddings=262144,
-            attention_bias=False,
-            attention_dropout=0.0,
-            rope_scaling={
-                "rope_type": "default",
-                "mrope_interleaved": True,
-                "mrope_section": [24, 20, 20],
-            },
-            attn_implementation="flex_attention" if USE_FLEX_ATTENTION else None,
-        )
-        self.layers = nn.ModuleList(
-            [Qwen3VLTextDecoderLayer(self.config, layer_idx) for layer_idx in range(num_layers)]
-        )
-        self.norm = Qwen3VLTextRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-        self.rotary_emb = Qwen3VLTextRotaryEmbedding(self.config)
-        self.proj = MLP(self.config.hidden_size, out_dim)
+        self.has_transformer_blocks = has_transformer_blocks
+        
+        if has_transformer_blocks:
+            self.config = Qwen3VLTextConfig(
+                hidden_size=2560,
+                intermediate_size=9728,
+                num_hidden_layers=num_layers,
+                num_attention_heads=32,
+                num_key_value_heads=8,
+                head_dim=128,
+                hidden_act="silu",
+                rms_norm_eps=1e-6,
+                rope_theta=5000000,
+                max_position_embeddings=262144,
+                attention_bias=False,
+                attention_dropout=0.0,
+                rope_scaling={
+                    "rope_type": "default",
+                    "mrope_interleaved": True,
+                    "mrope_section": [24, 20, 20],
+                },
+                attn_implementation="flex_attention" if USE_FLEX_ATTENTION else None,
+            )
+            self.layers = nn.ModuleList(
+                [Qwen3VLTextDecoderLayer(self.config, layer_idx) for layer_idx in range(num_layers)]
+            )
+            self.norm = Qwen3VLTextRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+            self.rotary_emb = Qwen3VLTextRotaryEmbedding(self.config)
+        else:
+            # Only keep the projection MLP when transformer blocks are disabled
+            self.layers = None
+            self.norm = None
+            self.rotary_emb = None
+            self.config = None
+        
+        self.proj = MLP(2560 if has_transformer_blocks else 2560, out_dim)
 
     def forward(
         self,
@@ -440,6 +455,10 @@ class Qwen3VLMllmEmbedding(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         mllm_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if not self.has_transformer_blocks:
+            # Bypass all transformer processing, directly project input
+            return self.proj(hidden_states)
+        
         batch_size, seq_len, _ = hidden_states.shape
 
         # Align position ids with Qwen3VL text model expectations
