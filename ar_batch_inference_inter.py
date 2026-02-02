@@ -17,6 +17,7 @@ from diffsynth.pipelines.wan_video_autoregressive_inter import (
     ModelConfig,
 )
 from diffsynth.core.data.unified_dataset import WanVideoInterDataset
+from diffsynth.core.loader.file import load_state_dict
 
 
 def parse_args():
@@ -91,7 +92,12 @@ def main():
     # Load LoRA
     lora_path = f"./models/train2/Wan2.1-T2V-1.3B_lora_agibot-alpha_{args.run_cate}/step-{args.lora_step}.safetensors"
     if args.lora_step != 0:
-        pipe.load_lora(pipe.dit, lora_path, alpha=1.0)
+        state_dict = load_state_dict(lora_path, torch_dtype=pipe.torch_dtype, device=accelerator.device)
+        dit_state_dict = {k.replace("dit.", ""): v for k, v in state_dict.items() if k.startswith("dit.")}
+        mllm_state_dict = {k.replace("mllm_encoder.", ""): v for k, v in state_dict.items() if k.startswith("mllm_encoder.")}
+        pipe.dit.load_state_dict(dit_state_dict, strict=False)
+        pipe.mllm_encoder.load_state_dict(mllm_state_dict, strict=False)
+        pipe.load_lora(pipe.dit, state_dict=dit_state_dict, alpha=1.0)
         if rank == 0:
             print(f"✅ LoRA loaded: {lora_path}")
 

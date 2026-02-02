@@ -813,3 +813,441 @@ def model_fn_wan_video_inter(
     
     noise_pred = torch.cat(noise_preds, dim=2)
     return noise_pred
+
+class WanVideoUnit_MLLMEmbedder_MetaQuery(PipelineUnit):
+    """使用 MetaQuery 方式的 MLLM 编码器，每个 block 独立编码"""
+    
+    def __init__(self):
+        super().__init__(
+            input_params=("input_video", "height", "width", "num_frames", "use_mllm_condition", "prompt_list", "block_info"),
+            output_params=("block_query_embeds",),
+            onload_model_names=("mllm_encoder",)
+        )
+        self.system_prompt = (
+            "Analyze the user's full video instruction and the provided partial video sequence. "
+            "First, concisely describe the key elements, actions, and scene of the existing video segment. "
+            "Then, predict the precise visual content for the next segment of video. "
+            "The prediction must strictly follow the user's full instruction while ensuring seamless temporal "
+            "continuity in motion, camera work, lighting, and object interactions with the existing frames. "
+            "For the initial frame (when no video exists), use the instruction as the sole basis to generate the starting scene."
+        )
+    
+    def process_video_for_mllm(self, pipe: WanVideoInterPipeline, input_video, block_info):
+        """与原始 WanVideoUnit_MLLMEmbedder.process_video_for_mllm 相同"""
+        video_blocks = []
+        video_metadata_blocks = []
+        sampled_counts = []
+        
+        for block in block_info:
+            block_frames = input_video[block["start_frame"]:block["end_frame"]]
+            total_frames_in_block = len(block_frames)
+            local_indices = sample_frames_with_constraints(total_frames_in_block, target_stride=8)
+            sampled_counts.append(len(local_indices))
+            global_indices = [block["start_frame"] + i for i in local_indices]
+            sampled_frames = [input_video[i] for i in global_indices]
+            metadata = {
+                "fps": 16,
+                "frames_indices": global_indices,
+                "total_num_frames": len(input_video)
+            }
+            video_blocks.append(sampled_frames)
+            video_metadata_blocks.append(metadata)
+        
+        return video_blocks, video_metadata_blocks, sampled_counts
+    
+    def encode_prompts_with_metaquery(
+        self, 
+        pipe: WanVideoInterPipeline, 
+        prompt_list: list, 
+        block_info: list, 
+        video_blocks: list, 
+        video_metadata_blocks: list
+    ) -> dict:
+        """为每个 block 构建独立序列并提取 query embeddings
+        
+        Returns:
+            block_query_embeds: dict mapping block_idx -> (1, num_metaqueries, hidden_dim)
+        """
+        block_query_embeds = {}
+        
+        for target_block_idx, target_block in enumerate(block_info):
+            # 构建该 block 可见的历史内容
+            user_content_parts = []
+            block_videos = []
+            block_metadata = []
+            
+            prev_prompt_idx = None
+            
+            for block_idx, block in enumerate(block_info):
+                if block_idx > target_block_idx:
+                    break  # 不包含未来的 block
+                    
+                prompt_idx = block["prompt_idx"]
+                
+                # 添加 prompt（如果是新的 clip）
+                if prompt_idx != prev_prompt_idx:
+                    if len(user_content_parts) > 0:
+                        user_content_parts.append(" ")
+                    user_content_parts.append(prompt_list[prompt_idx])
+                    prev_prompt_idx = prompt_idx
+                
+                # 只添加当前 block 之前的 video（不包含当前 block 的 video）
+                if block_idx < target_block_idx:
+                    user_content_parts.append(" <|vision_start|><|video_pad|><|vision_end|>")
+                    block_videos.append(video_blocks[block_idx])
+                    block_metadata.append(video_metadata_blocks[block_idx])
+            
+            user_content = "".join(user_content_parts)
+            
+            # 构建完整对话格式
+            full_text = (
+                f"<|im_start|>system\n{self.system_prompt}<|im_end|>\n"
+                f"<|im_start|>user\n{user_content}<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+            )
+            
+            # 调用 processor 处理 text + video
+            if block_videos:
+                model_inputs = pipe.mllm_processor(
+                    text=[full_text],
+                    videos=block_videos,
+                    padding=True,
+                    video_metadata=block_metadata,
+                    return_tensors="pt",
+                    do_resize=False,
+                    do_sample_frames=False
+                ).to(pipe.device)
+            else:
+                model_inputs = pipe.mllm_processor(
+                    text=[full_text],
+                    videos=None,
+                    padding=True,
+                    return_tensors="pt",
+                ).to(pipe.device)
+            
+            # 在末尾追加 query token ids
+            input_ids = model_inputs["input_ids"]
+            query_ids = pipe.mllm_encoder.get_query_token_ids().unsqueeze(0).to(input_ids.device)
+            input_ids = torch.cat([input_ids, query_ids], dim=1)
+            
+            # 更新 attention_mask
+            attention_mask = model_inputs["attention_mask"]
+            query_mask = torch.ones(1, query_ids.shape[1], device=attention_mask.device, dtype=attention_mask.dtype)
+            attention_mask = torch.cat([attention_mask, query_mask], dim=1)
+            
+            model_inputs["input_ids"] = input_ids
+            model_inputs["attention_mask"] = attention_mask
+            
+            # 通过 MLLM 编码
+            hidden_states = pipe.mllm_encoder(**model_inputs)[-1]
+            
+            # 提取 query embeddings
+            query_embeds = pipe.mllm_encoder.extract_query_hidden_states(
+                hidden_states, model_inputs["input_ids"]
+            )
+            
+            block_query_embeds[target_block_idx] = query_embeds
+        
+        return block_query_embeds
+    
+    def process(self, pipe: WanVideoInterPipeline, prompt_list, input_video, height, width, num_frames, block_info, use_mllm_condition=False):
+        if not use_mllm_condition:
+            return {"block_query_embeds": None}
+        pipe.load_models_to_device(self.onload_model_names)
+        
+        video_blocks, video_metadata_blocks, _ = self.process_video_for_mllm(
+            pipe, input_video, block_info
+        )
+        
+        block_query_embeds = self.encode_prompts_with_metaquery(
+            pipe, prompt_list, block_info, video_blocks, video_metadata_blocks
+        )
+        
+        return {"block_query_embeds": block_query_embeds}
+
+
+def compute_noise_pred_per_block_metaquery(
+    dit: WanModel,
+    block_idx: int,
+    block_info: dict,
+    x_full: torch.Tensor,
+    input_latents: torch.Tensor,
+    clean_input_latents: torch.Tensor,
+    freqs_full: torch.Tensor,
+    context_per_block: dict,
+    t: torch.Tensor,
+    t_mod: torch.Tensor,
+    t_clean: torch.Tensor,
+    t_mod_clean: torch.Tensor,
+    mllm_embeddings: torch.Tensor,  # (B, num_metaqueries, D) 固定长度，可为 None
+    tokens_per_latent_frame: int,
+    use_gradient_checkpointing: bool,
+    device: torch.device,
+    mllm_cfg_drop: float = 0.0,
+) -> torch.Tensor:
+    """MetaQuery 版本的 compute_noise_pred_per_block，移除了 mask 相关代码"""
+    latent_start = block_info["latent_start"]
+    latent_end = block_info["latent_end"]
+    
+    context = context_per_block[block_idx]
+
+    # Apply mllm_cfg_drop per block (use torch.rand for distributed sync)
+    mllm_zero_out = False
+    if mllm_cfg_drop > 0 and torch.rand(1).item() < mllm_cfg_drop:
+        mllm_zero_out= True
+    
+    x_block = x_full[:, :, latent_start:latent_end, :, :]
+    x_patched = dit.patchify(x_block)
+    f, h, w = x_patched.shape[2:]
+    x_noisy = rearrange(x_patched, 'b c f h w -> b (f h w) c').contiguous()
+    
+    clean_frame_count = CLEAN_FRAME_COUNT
+    keep_mask = None
+    block_ids = None
+    
+    clean_latents_source = clean_input_latents if clean_input_latents is not None else input_latents
+
+    if block_idx > 0 and clean_frame_count > 0 and clean_latents_source is not None:
+        prev_latent_end = latent_start
+        prev_latent_start = max(0, prev_latent_end - clean_frame_count)
+        actual_clean_count = prev_latent_end - prev_latent_start
+        if actual_clean_count > 0:
+            clean_latents = clean_latents_source[:, :, prev_latent_start:prev_latent_end, :, :]
+            clean_patched = dit.patchify(clean_latents)
+            clean_tokens = rearrange(clean_patched, 'b c f h w -> b (f h w) c').contiguous()
+            
+            x_combined = torch.cat([clean_tokens, x_noisy], dim=1)
+            
+            num_clean_tokens = clean_tokens.shape[1]
+            num_noisy_tokens = x_noisy.shape[1]
+            keep_mask = torch.cat([
+                torch.zeros(num_clean_tokens, dtype=torch.bool, device=device),
+                torch.ones(num_noisy_tokens, dtype=torch.bool, device=device)
+            ], dim=0)
+            block_ids = torch.cat([
+                torch.full((num_clean_tokens,), -1, dtype=torch.int32, device=device),
+                torch.full((num_noisy_tokens,), 0, dtype=torch.int32, device=device)
+            ], dim=0)
+            
+            start_token_noisy = latent_start * tokens_per_latent_frame
+            end_token_noisy = latent_end * tokens_per_latent_frame
+            freqs_noisy = freqs_full[start_token_noisy:end_token_noisy]
+            
+            start_token_clean = prev_latent_start * tokens_per_latent_frame
+            end_token_clean = prev_latent_end * tokens_per_latent_frame
+            freqs_clean = freqs_full[start_token_clean:end_token_clean]
+            freqs_combined = torch.cat([freqs_clean, freqs_noisy], dim=0)
+            
+            t_combined = torch.cat([
+                t_clean[:, None, :].expand(t_clean.shape[0], num_clean_tokens, t_clean.shape[-1]),
+                t[:, None, :].expand(t.shape[0], num_noisy_tokens, t.shape[-1])
+            ], dim=1)
+            t_mod_combined = torch.cat([
+                t_mod_clean[:, None, :, :].expand(t_mod_clean.shape[0], num_clean_tokens, t_mod_clean.shape[-2], t_mod_clean.shape[-1]),
+                t_mod[:, None, :, :].expand(t_mod.shape[0], num_noisy_tokens, t_mod.shape[-2], t_mod.shape[-1])
+            ], dim=1)
+            
+            x_input = x_combined
+            freqs_input = freqs_combined
+            t_input = t_combined
+            t_mod_input = t_mod_combined
+        else:
+            x_input = x_noisy
+            freqs_input = freqs_full[latent_start * tokens_per_latent_frame:latent_end * tokens_per_latent_frame]
+            t_input = t
+            t_mod_input = t_mod
+    else:
+        x_input = x_noisy
+        freqs_input = freqs_full[latent_start * tokens_per_latent_frame:latent_end * tokens_per_latent_frame]
+        t_input = t
+        t_mod_input = t_mod
+
+    # 构建 DiT attention mask（clean tokens 之间的 mask）
+    dit_block_mask = None
+    # if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and \
+    #    block_ids is not None and keep_mask is not None:
+    #     B = x_input.shape[0]
+    #     Q_LEN = x_input.shape[1]
+    #     KV_LEN = Q_LEN
+        
+    #     def mask_mod_dit(b, h, q_idx, kv_idx):
+    #         same_block = block_ids[q_idx] == block_ids[kv_idx]
+    #         q_is_clean = ~keep_mask[q_idx]
+    #         kv_is_noisy = keep_mask[kv_idx]
+    #         invalid_clean_look = q_is_clean & kv_is_noisy
+    #         return same_block & (~invalid_clean_look)
+        
+    #     dit_block_mask = create_block_mask(
+    #         mask_mod_dit, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
+    #         device=str(device)
+    #     )
+    
+    def create_custom_forward(module):
+        def custom_forward(*inputs):
+            return module(*inputs)
+        return custom_forward
+    
+    for dit_block in dit.blocks:
+        if use_gradient_checkpointing:
+            x_input = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(dit_block),
+                x_input, context, t_mod_input, freqs_input,
+                mllm_embeddings, None, None, dit_block_mask,
+                None, mllm_zero_out,
+                use_reentrant=False,
+            )
+        else:
+            x_input = dit_block(
+                x_input, context, t_mod_input, freqs_input,
+                mllm_embeddings=mllm_embeddings,
+                mllm_mask=None,  # MetaQuery 不需要 mask
+                mllm_block_mask=None,
+                dit_block_mask=dit_block_mask,
+                mllm_zero_out=mllm_zero_out,
+            )
+    
+    x_output = dit.head(x_input, t_input if t_input.dim() == 3 else t_input)
+    
+    if keep_mask is not None:
+        x_output = x_output[:, keep_mask]
+    
+    noise_pred = dit.unpatchify(x_output, (f, h, w))
+    
+    return noise_pred
+
+
+def model_fn_wan_video_inter_metaquery(
+    dit: WanModel,
+    latents: torch.Tensor,
+    input_latents: torch.Tensor,
+    block_info: list,
+    timestep: torch.Tensor,
+    prompt_embeddings_map: dict,
+    block_query_embeds: dict,  # MetaQuery: dict[block_idx] -> (1, num_metaqueries, D)
+    use_gradient_checkpointing: bool = False,
+    clean_timestep: torch.Tensor = None,
+    clean_input_latents: torch.Tensor = None,
+    t5_cfg_drop: float = 0.0,
+    mllm_cfg_drop: float = 0.0,
+    **kwargs,
+) -> torch.Tensor:
+    """MetaQuery 版本的 model_fn_wan_video_inter"""
+    context_per_prompt = {idx: dit.text_embedding(emb) for idx, emb in prompt_embeddings_map.items()}
+    context_per_block = {}
+    for block in block_info:
+        block_idx = block["global_block_idx"]
+        prompt_idx = block["prompt_idx"]
+        context_per_block[block_idx] = context_per_prompt[prompt_idx]
+        
+        # Apply t5_cfg_drop per block (use torch.rand for distributed sync)
+        if t5_cfg_drop > 0 and torch.rand(1).item() < t5_cfg_drop:
+            # Zero out t5 embedding for this block
+            context_per_block[block_idx] = torch.zeros_like(context_per_prompt[prompt_idx])
+        else:
+            context_per_block[block_idx] = context_per_prompt[prompt_idx]
+    
+    # 处理 MLLM query embeddings（每个 block 独立）
+    mllm_embeddings_per_block = {}
+    if hasattr(dit, "has_mllm_input") and dit.has_mllm_input and block_query_embeds is not None:
+        for block_idx, query_embeds in block_query_embeds.items():
+            # 使用 mllm_embedding 层处理（双向 attention）
+            mllm_embeddings_per_block[block_idx] = dit.mllm_embedding(
+                query_embeds,
+                position_ids=None,  # 让 mllm_embedding 自动生成
+                mllm_mask=None,  # 双向 attention，无 mask
+            )
+    
+    t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
+    t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
+    
+    if clean_timestep is None:
+        clean_timestep = t.new_zeros((t.shape[0],))
+    t_clean = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, clean_timestep))
+    t_mod_clean = dit.time_projection(t_clean).unflatten(1, (6, dit.dim))
+    
+    x = latents
+    x_patched_test = dit.patchify(x)
+    f_total, h, w = x_patched_test.shape[2:]
+    
+    freqs = torch.cat([
+        dit.freqs[0][:f_total].view(f_total, 1, 1, -1).expand(f_total, h, w, -1),
+        dit.freqs[1][:h].view(1, h, 1, -1).expand(f_total, h, w, -1),
+        dit.freqs[2][:w].view(1, 1, w, -1).expand(f_total, h, w, -1)
+    ], dim=-1).reshape(f_total * h * w, 1, -1).to(x.device)
+    
+    tokens_per_latent_frame = h * w
+    
+    noise_preds = []
+    for block in block_info:
+        block_idx = block["global_block_idx"]
+        mllm_embeddings = mllm_embeddings_per_block.get(block_idx, None)
+        
+        noise_pred_block = compute_noise_pred_per_block_metaquery(
+            dit=dit,
+            block_idx=block_idx,
+            block_info=block,
+            x_full=x,
+            input_latents=input_latents,
+            clean_input_latents=clean_input_latents,
+            freqs_full=freqs,
+            context_per_block=context_per_block,
+            t=t,
+            t_mod=t_mod,
+            t_clean=t_clean,
+            t_mod_clean=t_mod_clean,
+            mllm_embeddings=mllm_embeddings,
+            tokens_per_latent_frame=tokens_per_latent_frame,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            device=x.device,
+        )
+        noise_preds.append(noise_pred_block)
+    
+    noise_pred = torch.cat(noise_preds, dim=2)
+    return noise_pred
+
+
+class WanVideoInterPipeline_MetaQuery(WanVideoInterPipeline):
+    """使用 MetaQuery 方式的 Pipeline"""
+    
+    def __init__(self, device="cuda", torch_dtype=torch.bfloat16):
+        super().__init__(device=device, torch_dtype=torch_dtype)
+        # 替换 MLLM Embedder 为 MetaQuery 版本
+        self.units = [
+            WanVideoUnit_ShapeChecker(),
+            WanVideoUnit_NoiseInitializer(),
+            WanVideoUnit_BlockScheduler(),
+            WanVideoUnit_InputVideoEmbedder(),
+            WanVideoUnit_PromptEmbedder(),
+            WanVideoUnit_MLLMEmbedder_MetaQuery(),  # 使用 MetaQuery 版本
+        ]
+        self.model_fn = model_fn_wan_video_inter_metaquery
+
+    @staticmethod
+    def from_pretrained(
+        torch_dtype: torch.dtype = torch.bfloat16,
+        device: Union[str, torch.device] = "cuda",
+        model_configs: list = [],
+        tokenizer_config: ModelConfig = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/"),
+        mllm_processor_config: ModelConfig = None,
+        redirect_common_files: bool = False,
+        use_usp: bool = False,
+        vram_limit: float = None,
+    ):
+        """Load pretrained models for MetaQuery pipeline."""
+        parent_pipe = WanVideoInterPipeline.from_pretrained(
+            torch_dtype=torch_dtype,
+            device=device,
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+            mllm_processor_config=mllm_processor_config,
+            redirect_common_files=redirect_common_files,
+            use_usp=use_usp,
+            vram_limit=vram_limit,
+        )
+
+        pipe = WanVideoInterPipeline_MetaQuery(device=device, torch_dtype=torch_dtype)
+        for attr in ["tokenizer", "text_encoder", "dit", "vae", "mllm_encoder", "mllm_processor", "scheduler"]:
+            if hasattr(parent_pipe, attr):
+                setattr(pipe, attr, getattr(parent_pipe, attr))
+        pipe.vram_management_enabled = parent_pipe.vram_management_enabled
+        return pipe
