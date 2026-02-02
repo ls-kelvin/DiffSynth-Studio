@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from .wan_video_inter import (
+from .wan_video_inter_3 import (
     WanVideoInterPipeline,
     WanVideoUnit_BlockScheduler,
     WanVideoUnit_PromptEmbedder,

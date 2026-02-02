@@ -383,7 +383,7 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
             input_params=("input_video", "height", "width", "num_frames", "use_mllm_condition", "prompt_list", "block_info"),
-            output_params=("mllm_hidden_states", "mllm_mask", "mllm_kv_len", "mllm_position_ids", "mllm_vision_ranges"),
+            output_params=("mllm_hidden_states", "mllm_mask", "mllm_kv_len", "mllm_position_ids", "mllm_vision_mask"),
             onload_model_names=("mllm_encoder",)
         )
     
@@ -469,9 +469,16 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         
         vision_start_positions = (input_ids[0] == vision_start_token_id).nonzero(as_tuple=True)[0]
         vision_end_positions = (input_ids[0] == vision_end_token_id).nonzero(as_tuple=True)[0]
+
+        vision_token_mask = torch.zeros((1, mllm_seq_len), device=input_ids.device, dtype=torch.bool)
+        num_vision_segs = min(len(vision_start_positions), len(vision_end_positions))
+        for seg_idx in range(num_vision_segs):
+            start_pos = vision_start_positions[seg_idx].item()
+            end_pos = vision_end_positions[seg_idx].item() + 1
+            if end_pos > start_pos:
+                vision_token_mask[:, start_pos:end_pos] = True
         
         mllm_mask = torch.zeros((1, num_dit_tokens), device=input_ids.device, dtype=torch.int32)
-        mllm_vision_ranges = torch.zeros((1, num_dit_tokens, 2), device=input_ids.device, dtype=torch.int32)
         
         vision_seg_offset = 0
         for block_idx, block in enumerate(block_info):
@@ -485,21 +492,14 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
             
             if block_idx == 0 or len(vision_end_positions) == 0 or len(vision_start_positions) == 0:
                 mllm_mask[:, start_dit_token:end_dit_token] = 0
-                mllm_vision_ranges[:, start_dit_token:end_dit_token, 0] = 0
-                mllm_vision_ranges[:, start_dit_token:end_dit_token, 1] = 0
             else:
                 end_pos_idx = min(max(vision_seg_offset - 1, 0), len(vision_end_positions) - 1)
                 end_mllm_prefix = vision_end_positions[end_pos_idx].item() + 1
                 mllm_mask[:, start_dit_token:end_dit_token] = min(end_mllm_prefix, mllm_seq_len)
-                
-                vision_range_start = vision_start_positions[0].item()
-                vision_range_end = vision_end_positions[end_pos_idx].item() + 1
-                mllm_vision_ranges[:, start_dit_token:end_dit_token, 0] = vision_range_start
-                mllm_vision_ranges[:, start_dit_token:end_dit_token, 1] = vision_range_end
             
             vision_seg_offset += num_vision_segs
             
-        return mllm_mask, mllm_seq_len, mllm_vision_ranges
+        return mllm_mask, mllm_seq_len, vision_token_mask
 
     def process(self, pipe: WanVideoInterPipeline, prompt_list, input_video, height, width, num_frames, block_info, use_mllm_condition=False):
         if not use_mllm_condition:
@@ -512,7 +512,7 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
         mllm_hidden_states, input_ids, position_ids = self.encode_prompt(
             pipe, prompt_list, block_info, video_blocks, video_metadata_blocks
         )
-        mllm_mask, mllm_kv_len, mllm_vision_ranges = self.calculate_mllm_mask(
+        mllm_mask, mllm_kv_len, mllm_vision_mask = self.calculate_mllm_mask(
             pipe, num_frames, height, width, input_ids, block_info, sampled_counts
         )
         return {
@@ -520,7 +520,7 @@ class WanVideoUnit_MLLMEmbedder(PipelineUnit):
             "mllm_mask": mllm_mask,
             "mllm_kv_len": mllm_kv_len,
             "mllm_position_ids": position_ids,
-            "mllm_vision_ranges": mllm_vision_ranges,
+            "mllm_vision_mask": mllm_vision_mask,
         }
 
 
@@ -539,7 +539,7 @@ def compute_noise_pred_per_block(
     t_mod_clean: torch.Tensor,
     mllm_embeddings: torch.Tensor,
     mllm_mask_full: torch.Tensor,
-    mllm_vision_ranges: torch.Tensor,
+    mllm_vision_mask: torch.Tensor,
     mllm_kv_len: int,
     tokens_per_latent_frame: int,
     use_gradient_checkpointing: bool,
@@ -555,7 +555,7 @@ def compute_noise_pred_per_block(
     # Apply mllm_cfg_drop per block (use torch.rand for distributed sync)
     mllm_zero_out = False
     if mllm_cfg_drop > 0 and torch.rand(1).item() < mllm_cfg_drop:
-        mllm_zero_out= True
+        mllm_zero_out = True
         
     x_block = x_full[:, :, latent_start:latent_end, :, :]
     x_patched = dit.patchify(x_block)
@@ -634,39 +634,41 @@ def compute_noise_pred_per_block(
         mllm_mask_input = mllm_mask_full[:, latent_start * tokens_per_latent_frame:latent_end * tokens_per_latent_frame] if mllm_mask_full is not None else None
 
     mllm_block_mask = None
-    if mllm_embeddings is not None and mllm_mask_input is not None and mllm_vision_ranges is not None:
-        start_token_global = latent_start * tokens_per_latent_frame
-        vision_range_start = mllm_vision_ranges[0, start_token_global, 0].item()
-        vision_range_end = mllm_vision_ranges[0, start_token_global, 1].item()
+    if mllm_embeddings is not None and mllm_mask_input is not None:
         prefix_len = int(mllm_mask_input[0, 0].item())
         mask_uniform = torch.all(mllm_mask_input == mllm_mask_input[:, :1]).item()
 
         if mask_uniform:
-            kv_start = max(0, min(vision_range_start, mllm_kv_len))
-            kv_end = max(0, min(min(vision_range_end, prefix_len), mllm_kv_len))
-            if kv_end <= kv_start:
-                # Keep cross-attn path active for DDP consistency; force zero output.
+            kv_end = max(0, min(prefix_len, mllm_kv_len))
+            if kv_end <= 0:
                 mllm_embeddings = mllm_embeddings[:, :1]
                 mllm_zero_out = True
             else:
-                mllm_embeddings = mllm_embeddings[:, kv_start:kv_end]
-        # elif FLEX_ATTENTION_AVAILABLE and create_block_mask is not None:
+                mllm_embeddings_slice = mllm_embeddings[:, :kv_end]
+                if mllm_vision_mask is not None:
+                    vision_mask_slice = mllm_vision_mask[:, :kv_end]
+                    mllm_embeddings = mllm_embeddings_slice[:, vision_mask_slice[0]]
+                else:
+                    mllm_embeddings = mllm_embeddings_slice
+        # elif FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and mllm_vision_mask is not None:
         #     B = x_input.shape[0]
         #     Q_LEN = x_input.shape[1]
         #     KV_LEN = mllm_kv_len
 
         #     def mask_mod(b, h, q_idx, kv_idx):
-        #         in_vision_range = (kv_idx >= vision_range_start) & (kv_idx < vision_range_end)
+        #         vision_ok = mllm_vision_mask[0, kv_idx]
         #         if mllm_mask_combined is not None:
         #             prefix_ok = kv_idx < mllm_mask_combined[b, q_idx]
         #         else:
         #             prefix_ok = kv_idx < mllm_mask_input[b, q_idx]
-        #         return in_vision_range & prefix_ok
+        #         return vision_ok & prefix_ok
 
         #     mllm_block_mask = create_block_mask(
         #         mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
         #         device=str(device)
         #     )
+        else:
+            print("Warning: Cannot create mllm_block_mask due to missing dependencies or inputs.")
     
     dit_block_mask = None
     # if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and \
@@ -732,7 +734,7 @@ def model_fn_wan_video_inter(
     mllm_mask: torch.Tensor,
     mllm_kv_len: int,
     mllm_position_ids: torch.Tensor,
-    mllm_vision_ranges: torch.Tensor,
+    mllm_vision_mask: torch.Tensor,
     use_gradient_checkpointing: bool = False,
     clean_timestep: torch.Tensor = None,
     clean_input_latents: torch.Tensor = None,
@@ -802,7 +804,7 @@ def model_fn_wan_video_inter(
             t_mod_clean=t_mod_clean,
             mllm_embeddings=mllm_embeddings,
             mllm_mask_full=mllm_mask,
-            mllm_vision_ranges=mllm_vision_ranges,
+            mllm_vision_mask=mllm_vision_mask,
             mllm_kv_len=mllm_kv_len,
             tokens_per_latent_frame=tokens_per_latent_frame,
             use_gradient_checkpointing=use_gradient_checkpointing,

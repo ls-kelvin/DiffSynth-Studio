@@ -6,6 +6,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import re
 from pathlib import Path
+from PIL import ImageFilter
 
 import torch
 from accelerate import Accelerator
@@ -20,7 +21,7 @@ from diffsynth.core.data.unified_dataset import WanVideoInterDataset
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--jsonl_path", type=str, default="/root/workspace/zzt/VideoCaption/output/agibot_result_sample.jsonl")
+    parser.add_argument("--jsonl_path", type=str, default="/root/workspace/zzt/data/AgiBotWorld-Alpha/agibot_result_sample.jsonl")
     parser.add_argument("--base_path", type=str, default="")
     parser.add_argument("--lora_step", type=int, default=7200)
     parser.add_argument("--run_cate", type=str, default="mllm")
@@ -40,7 +41,7 @@ def parse_args():
     parser.add_argument("--source_fps", type=int, default=30)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--max_frames", type=int, default=477)
+    parser.add_argument("--max_frames", type=int, default=241)
     return parser.parse_args()
 
 
@@ -107,6 +108,11 @@ def main():
         prompt_list = item.get("prompt_list", [])
         clip_frames = item.get("clip_frames", [])
         input_video = item.get("video", None)
+        
+        # input_video = [
+        #     frame.filter(ImageFilter.GaussianBlur(radius=2))
+        #     for frame in input_video
+        # ]
 
         if not prompt_list or not clip_frames or input_video is None:
             accelerator.print(f"❌ [Rank {rank}] Missing fields for item {idx}")
@@ -156,7 +162,7 @@ def main():
                 block_idx = block_video["block_idx"]
                 prompt_idx = block_video["prompt_idx"]
                 frames = block_video["frames"]
-                block_filename = f"{video_id}_ar_inter_block{block_idx}_prompt{prompt_idx}.mp4"
+                block_filename = f"{video_id}_ar_inter_gt_block{block_idx}_prompt{prompt_idx}.mp4"
                 block_save_path = os.path.join(output_dir, block_filename)
                 counter = 1
                 orig_block_save_path = block_save_path

@@ -349,6 +349,7 @@ class DiTBlock(nn.Module):
         mllm_block_mask: Optional[object] = None,
         dit_block_mask: Optional[object] = None,
         cross_attn_q_mask: Optional[torch.Tensor] = None,
+        mllm_zero_out: bool = False,
     ):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
@@ -370,13 +371,16 @@ class DiTBlock(nn.Module):
         norm_x = self.norm3(x)
         x = x + self.cross_attn(norm_x, context, q_mask=cross_attn_q_mask)
         if self.has_mllm_input and (mllm_embeddings is not None):
-            x = x + self.cross_attn2(
+            mllm_out = self.cross_attn2(
                 norm_x,
                 mllm_embeddings,
                 mllm_mask=mllm_mask,
                 mllm_block_mask=mllm_block_mask,
                 q_mask=cross_attn_q_mask,
             )
+            if mllm_zero_out:
+                mllm_out = mllm_out * 0
+            x = x + mllm_out
 
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -409,7 +413,7 @@ class Qwen3VLMllmEmbedding(nn.Module):
         self,
         out_dim: int,
         num_layers: int = 4,
-        has_transformer_blocks: bool = True,
+        has_transformer_blocks: bool = True if os.getenv("MLLM_TRANSFORMER") != "0" else False,
     ):
         super().__init__()
         self.has_transformer_blocks = has_transformer_blocks
@@ -755,7 +759,7 @@ class WanModel(torch.nn.Module):
         x = self.unpatchify(x, (f, h, w))
         return x
 
-    def load_state_dict(self, state_dict, assign: bool = False, strict: bool = True, path="models/step-66000.safetensors"):
+    def load_state_dict(self, state_dict, assign: bool = False, strict: bool = True, path="models/step-66000.safetensors" if os.getenv("MLLM_INIT") else None):
         """Custom load_state_dict to support partial loading for backward compatibility.
 
         When strict=False, missing keys in the provided state_dict are ignored,

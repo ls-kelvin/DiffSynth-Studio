@@ -1,7 +1,7 @@
 import torch, os, argparse, accelerate, warnings
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.data import WanVideoInterDataset
-from diffsynth.pipelines.wan_video_inter import WanVideoInterPipeline, ModelConfig
+from diffsynth.pipelines.wan_video_inter_3 import WanVideoInterPipeline, ModelConfig
 from diffsynth.diffusion import *
 import random
 random.seed(42)
@@ -182,8 +182,13 @@ class WanMLLMInterTrainingModule(DiffusionTrainingModule):
     def forward(self, data, inputs=None):
         if inputs is None:
             inputs = self.get_pipeline_inputs(data)
-        inputs[0]["t5_cfg_drop"] = self.t5_cfg_drop
-        inputs[0]["mllm_cfg_drop"] = self.mllm_cfg_drop
+        
+        # Ensure cfg_drop parameters are always added (even for cached data)
+        inputs_list = list(inputs)
+        inputs_list[0]["t5_cfg_drop"] = self.t5_cfg_drop
+        inputs_list[0]["mllm_cfg_drop"] = self.mllm_cfg_drop
+        inputs = tuple(inputs_list)
+        
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)

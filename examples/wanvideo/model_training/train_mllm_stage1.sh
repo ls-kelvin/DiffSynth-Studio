@@ -9,10 +9,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8 accelerate launch \
   --config_file examples/wanvideo/model_training/distributed_eval.yaml \
   examples/wanvideo/model_training/train_mllm_inter.py \
   --dataset_base_path "" \
-  --dataset_metadata_path /root/workspace/zzt/VideoCaption/output/agirobot_result.jsonl \
+  --dataset_metadata_path /root/workspace/zzt/data/AgiBotWorld-Alpha/agirobot_result_.jsonl \
   --height 480 \
   --width 832 \
-  --num_frames 125 \
+  --num_frames 257 \
   --target_fps 6 \
   --dataset_repeat 1 \
   --model_path '[
@@ -27,7 +27,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8 accelerate launch \
   --mllm_processor_path "/root/workspace/zzt/models/Qwen/Qwen3-VL-4B-Instruct" \
   --learning_rate 1e-4 \
   --remove_prefix_in_ckpt "pipe.dit." \
-  --output_path "./models/train2/agibot-alpha" \
+  --output_path "./data/train2/agibot-alpha" \
   --task "sft:data_process" \
   --lora_base_model "dit" \
   --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
