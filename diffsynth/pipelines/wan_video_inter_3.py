@@ -667,6 +667,8 @@ def compute_noise_pred_per_block(
         #         mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
         #         device=str(device)
         #     )
+        else:
+            raise ValueError("Currently only uniform MLLM mask is supported.")
     
     dit_block_mask = None
     # if FLEX_ATTENTION_AVAILABLE and create_block_mask is not None and \
@@ -863,91 +865,65 @@ class WanVideoUnit_MLLMEmbedder_MetaQuery(PipelineUnit):
         video_blocks: list, 
         video_metadata_blocks: list
     ) -> dict:
-        """为每个 block 构建独立序列并提取 query embeddings
-        
-        Returns:
-            block_query_embeds: dict mapping block_idx -> (1, num_metaqueries, hidden_dim)
-        """
-        block_query_embeds = {}
-        
-        for target_block_idx, target_block in enumerate(block_info):
-            # 构建该 block 可见的历史内容
+        """单次编码：在文本中插入 MetaQuery special tokens"""
+        full_text_parts = [f"<|im_start|>system\n{self.system_prompt}<|im_end|>\n"]
+        all_videos = []
+        all_metadata = []
+        prev_prompt_idx = None
+
+        query_tokens = ["<|begin_of_query|>"]
+        query_tokens.extend([f"<|query_{i}|>" for i in range(pipe.mllm_encoder.num_metaqueries)])
+        query_tokens.append("<|end_of_query|>")
+        query_str = "".join(query_tokens)
+
+        for block_idx, block in enumerate(block_info):
             user_content_parts = []
-            block_videos = []
-            block_metadata = []
-            
-            prev_prompt_idx = None
-            
-            for block_idx, block in enumerate(block_info):
-                if block_idx > target_block_idx:
-                    break  # 不包含未来的 block
-                    
-                prompt_idx = block["prompt_idx"]
-                
-                # 添加 prompt（如果是新的 clip）
-                if prompt_idx != prev_prompt_idx:
-                    if len(user_content_parts) > 0:
-                        user_content_parts.append(" ")
-                    user_content_parts.append(prompt_list[prompt_idx])
-                    prev_prompt_idx = prompt_idx
-                
-                # 只添加当前 block 之前的 video（不包含当前 block 的 video）
-                if block_idx < target_block_idx:
-                    user_content_parts.append(" <|vision_start|><|video_pad|><|vision_end|>")
-                    block_videos.append(video_blocks[block_idx])
-                    block_metadata.append(video_metadata_blocks[block_idx])
-            
+            prompt_idx = block["prompt_idx"]
+            if prompt_idx != prev_prompt_idx:
+                user_content_parts.append(prompt_list[prompt_idx])
+                prev_prompt_idx = prompt_idx
+            if block_idx > 0:
+                if len(user_content_parts) > 0:
+                    user_content_parts.append(" ")
+                user_content_parts.append(" <|vision_start|><|video_pad|><|vision_end|>")
+                all_videos.append(video_blocks[block_idx - 1])
+                all_metadata.append(video_metadata_blocks[block_idx - 1])
             user_content = "".join(user_content_parts)
-            
-            # 构建完整对话格式
-            full_text = (
-                f"<|im_start|>system\n{self.system_prompt}<|im_end|>\n"
-                f"<|im_start|>user\n{user_content}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
+            full_text_parts.append(f"<|im_start|>user\n{user_content}<|im_end|>\n")
+            full_text_parts.append(f"<|im_start|>assistant\n{query_str}<|im_end|>\n")
+
+        full_text = "".join(full_text_parts)
+        model_inputs = pipe.mllm_processor(
+            text=[full_text],
+            videos=all_videos if len(all_videos) > 0 else None,
+            padding=True,
+            video_metadata=all_metadata if len(all_metadata) > 0 else None,
+            return_tensors="pt",
+            do_resize=False,
+            do_sample_frames=False
+        ).to(pipe.device)
+
+        hidden_states = pipe.mllm_encoder(**model_inputs)[-1]
+        input_ids = model_inputs["input_ids"]
+
+        boq = pipe.mllm_encoder.boq_token_id
+        eoq = pipe.mllm_encoder.eoq_token_id
+        if boq is None or eoq is None:
+            raise RuntimeError("MetaQuery tokens are not initialized.")
+
+        boq_positions = (input_ids[0] == boq).nonzero(as_tuple=True)[0].tolist()
+        eoq_positions = (input_ids[0] == eoq).nonzero(as_tuple=True)[0].tolist()
+        if len(boq_positions) != len(block_info) or len(eoq_positions) != len(block_info):
+            raise RuntimeError(
+                f"Expected {len(block_info)} MetaQuery segments, got {len(boq_positions)}."
             )
-            
-            # 调用 processor 处理 text + video
-            if block_videos:
-                model_inputs = pipe.mllm_processor(
-                    text=[full_text],
-                    videos=block_videos,
-                    padding=True,
-                    video_metadata=block_metadata,
-                    return_tensors="pt",
-                    do_resize=False,
-                    do_sample_frames=False
-                ).to(pipe.device)
-            else:
-                model_inputs = pipe.mllm_processor(
-                    text=[full_text],
-                    videos=None,
-                    padding=True,
-                    return_tensors="pt",
-                ).to(pipe.device)
-            
-            # 在末尾追加 query token ids
-            input_ids = model_inputs["input_ids"]
-            query_ids = pipe.mllm_encoder.get_query_token_ids().unsqueeze(0).to(input_ids.device)
-            input_ids = torch.cat([input_ids, query_ids], dim=1)
-            
-            # 更新 attention_mask
-            attention_mask = model_inputs["attention_mask"]
-            query_mask = torch.ones(1, query_ids.shape[1], device=attention_mask.device, dtype=attention_mask.dtype)
-            attention_mask = torch.cat([attention_mask, query_mask], dim=1)
-            
-            model_inputs["input_ids"] = input_ids
-            model_inputs["attention_mask"] = attention_mask
-            
-            # 通过 MLLM 编码
-            hidden_states = pipe.mllm_encoder(**model_inputs)[-1]
-            
-            # 提取 query embeddings
-            query_embeds = pipe.mllm_encoder.extract_query_hidden_states(
-                hidden_states, model_inputs["input_ids"]
-            )
-            
-            block_query_embeds[target_block_idx] = query_embeds
-        
+
+        block_query_embeds = {}
+        for idx, (b_pos, e_pos) in enumerate(zip(boq_positions, eoq_positions)):
+            if e_pos <= b_pos:
+                raise RuntimeError("Invalid MetaQuery token positions.")
+            block_query_embeds[idx] = hidden_states[:, b_pos + 1:e_pos, :]
+
         return block_query_embeds
     
     def process(self, pipe: WanVideoInterPipeline, prompt_list, input_video, height, width, num_frames, block_info, use_mllm_condition=False):
@@ -1250,4 +1226,6 @@ class WanVideoInterPipeline_MetaQuery(WanVideoInterPipeline):
             if hasattr(parent_pipe, attr):
                 setattr(pipe, attr, getattr(parent_pipe, attr))
         pipe.vram_management_enabled = parent_pipe.vram_management_enabled
+        if pipe.mllm_encoder is not None and pipe.mllm_processor is not None:
+            pipe.mllm_encoder.init_metaquery_tokens_from_tokenizer(pipe.mllm_processor.tokenizer)
         return pipe

@@ -11,7 +11,7 @@ class WanMLLMEncoder(nn.Module):
     the model is instantiated from an explicit config instead of using from_pretrained.
     """
 
-    def __init__(self, torch_dtype: torch.dtype = torch.bfloat16, num_metaqueries: int = 0):
+    def __init__(self, torch_dtype: torch.dtype = torch.bfloat16, num_metaqueries: int = int(os.getenv("MLLM_QEURY", "0"))):
         super().__init__()
         self.num_metaqueries = num_metaqueries
         config = Qwen3VLConfig(**{
@@ -88,44 +88,41 @@ class WanMLLMEncoder(nn.Module):
         self.query_token_ids = None
         self._original_vocab_size = None
         
-        if num_metaqueries > 0:
-            self._init_metaquery_tokens()
+        # MetaQuery tokens are initialized after weights are loaded.
 
-    def _init_metaquery_tokens(self):
-        """初始化 MetaQuery tokens，扩展 token embedding"""
-        embed_tokens = self.model.language_model.embed_tokens
-        self._original_vocab_size = embed_tokens.num_embeddings
-        
-        # 扩展 token embedding: +2 for <begin_of_query>/<end_of_query>, +num_metaqueries for query tokens
-        new_vocab_size = self._original_vocab_size + self.num_metaqueries + 2
-        self._resize_token_embeddings(new_vocab_size)
-        
-        # 记录特殊 token id
-        self.boq_token_id = self._original_vocab_size      # <begin_of_query>
-        self.eoq_token_id = self._original_vocab_size + 1  # <end_of_query>
-        self.query_token_ids = list(range(self._original_vocab_size + 2, new_vocab_size))
+    def init_metaquery_tokens_from_tokenizer(self, tokenizer):
+        """使用 tokenizer 的 special tokens 初始化 MetaQuery tokens"""
+        if self.num_metaqueries <= 0:
+            return
+        if tokenizer is None:
+            raise ValueError("Tokenizer is required to initialize MetaQuery tokens.")
 
-    def _resize_token_embeddings(self, new_vocab_size: int):
-        """扩展 token embedding 层"""
-        old_embeddings = self.model.language_model.embed_tokens
-        old_vocab_size, embedding_dim = old_embeddings.weight.shape
-        
-        new_embeddings = nn.Embedding(
-            new_vocab_size, embedding_dim, 
-            padding_idx=old_embeddings.padding_idx,
-            dtype=old_embeddings.weight.dtype
-        )
-        new_embeddings.weight.data[:old_vocab_size] = old_embeddings.weight.data
-        # 用均值初始化新 token
-        mean_embedding = old_embeddings.weight.data.mean(dim=0)
-        new_embeddings.weight.data[old_vocab_size:] = mean_embedding
-        
-        self.model.language_model.embed_tokens = new_embeddings
+        token_list = ["<|begin_of_query|>", "<|end_of_query|>"]
+        token_list.extend([f"<|query_{i}|>" for i in range(self.num_metaqueries)])
+        tokenizer.add_special_tokens({"additional_special_tokens": token_list})
+
+        new_vocab_size = len(tokenizer)
+        self.model.resize_token_embeddings(new_vocab_size, pad_to_multiple_of=128)
+
+        def _token_id(tok: str) -> int:
+            tok_id = tokenizer.convert_tokens_to_ids(tok)
+            if tokenizer.convert_ids_to_tokens(tok_id) != tok:
+                raise ValueError(f"MetaQuery token {tok} is not in tokenizer vocab.")
+            return tok_id
+
+        self.boq_token_id = _token_id("<|begin_of_query|>")
+        self.eoq_token_id = _token_id("<|end_of_query|>")
+        self.query_token_ids = [_token_id(f"<|query_{i}|>") for i in range(self.num_metaqueries)]
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def get_query_token_ids(self) -> torch.LongTensor:
         """返回 query token 序列: [boq_id, query0_id, query1_id, ..., eoq_id]"""
         if self.num_metaqueries <= 0:
             raise ValueError("MetaQuery not enabled")
+        if self.boq_token_id is None or self.eoq_token_id is None or self.query_token_ids is None:
+            raise ValueError("MetaQuery tokens are not initialized. Call init_metaquery_tokens_from_tokenizer first.")
         ids = [self.boq_token_id] + self.query_token_ids + [self.eoq_token_id]
         return torch.tensor(ids, dtype=torch.long)
 
@@ -167,11 +164,16 @@ class WanMLLMEncoder(nn.Module):
             param.requires_grad = False
         
         if self.num_metaqueries > 0:
+            if self.boq_token_id is None or self.eoq_token_id is None or self.query_token_ids is None:
+                raise ValueError("MetaQuery tokens are not initialized. Call init_metaquery_tokens_from_tokenizer first.")
             self.model.language_model.embed_tokens.weight.requires_grad = True
             # 注册 hook 确保梯度只更新新增的 token
             def freeze_hook(grad):
                 grad = grad.clone()
-                grad[:self._original_vocab_size].zero_()
+                trainable_ids = [self.boq_token_id] + self.query_token_ids + [self.eoq_token_id]
+                mask = torch.zeros(grad.shape[0], device=grad.device, dtype=torch.bool)
+                mask[torch.tensor(trainable_ids, device=grad.device, dtype=torch.long)] = True
+                grad[~mask] = 0
                 return grad
             self.model.language_model.embed_tokens.weight.register_hook(freeze_hook)
 

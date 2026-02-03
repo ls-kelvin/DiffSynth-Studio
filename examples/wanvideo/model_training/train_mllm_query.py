@@ -168,7 +168,7 @@ class WanMLLMQueryTrainingModule(DiffusionTrainingModule):
         # Enable query token embeddings in MLLM encoder
         if hasattr(pipe, 'mllm_encoder') and pipe.mllm_encoder is not None:
             pipe.mllm_encoder.freeze_all_except_queries()
-            print(f"Enabled training for {self.num_metaqueries} MetaQuery token embeddings in MLLM encoder.")
+            print(f"Enabled training for {pipe.mllm_encoder.num_metaqueries} MetaQuery token embeddings in MLLM encoder.")
     
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
@@ -182,8 +182,6 @@ class WanMLLMQueryTrainingModule(DiffusionTrainingModule):
     
     def get_pipeline_inputs(self, data):
         prompt_list = data["prompt_list"]
-        if self.cfg_drop > 0 and random.random() < self.cfg_drop:
-            prompt_list = [" "] * len(prompt_list)
         
         inputs_posi = {}
         inputs_nega = {}

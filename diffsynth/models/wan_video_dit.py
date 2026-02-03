@@ -491,6 +491,7 @@ class Qwen3VLMllmEmbedding(nn.Module):
             allowed = kv_idx < self_prefix.unsqueeze(-1)  # (B, Q, KV)
             attn_mask = (~allowed).unsqueeze(1)  # (B,1,Q,KV)
 
+        attn_mask=None
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(
