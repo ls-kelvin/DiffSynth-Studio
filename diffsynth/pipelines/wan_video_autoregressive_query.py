@@ -1,9 +1,8 @@
 """
-Autoregressive inference for Wan Video Inter with MLLM condition.
+Autoregressive inference for Wan Video with MetaQuery MLLM condition.
 
-This pipeline generates video blocks sequentially. For each block, it uses
-the prompts and the previously generated video frames (or provided input_video)
-as MLLM context, then denoises only the current block's latents.
+This pipeline generates video blocks sequentially using fixed-length MetaQuery
+embeddings as MLLM condition, instead of variable-length history-based KV.
 """
 
 from typing import Optional, List, Union
@@ -13,40 +12,30 @@ from PIL import Image
 from tqdm import tqdm
 
 from .wan_video_inter_3 import (
-    WanVideoInterPipeline,
+    WanVideoInterPipeline_MetaQuery,
     WanVideoUnit_BlockScheduler,
     WanVideoUnit_PromptEmbedder,
+    WanVideoUnit_MLLMEmbedder_MetaQuery,
     BLOCK_DURATION,
-    compute_noise_pred_per_block,
+    compute_noise_pred_per_block_metaquery,
     sample_frames_with_constraints,
 )
 from ..models.wan_video_dit import WanModel, sinusoidal_embedding_1d
 from ..core import ModelConfig
 
 
-_MLLM_TEMPLATE = (
-    "<|im_start|>system\n"
-    "Analyze the user's full video instruction and the provided partial video sequence. "
-    "First, concisely describe the key elements, actions, and scene of the existing video segment. "
-    "Then, predict the precise visual content for the next segment of video. "
-    "The prediction must strictly follow the user's full instruction while ensuring seamless temporal "
-    "continuity in motion, camera work, lighting, and object interactions with the existing frames. "
-    "For the initial frame (when no video exists), use the instruction as the sole basis to generate "
-    "the starting scene.<|im_end|>\n<|im_start|>user\n"
-)
-_MLLM_DROP_IDX = 111
-
-
-class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
+class WanVideoAutoregressiveQueryPipeline(WanVideoInterPipeline_MetaQuery):
     """
-    Autoregressive inference pipeline for Wan Video Inter.
+    Autoregressive inference pipeline using MetaQuery MLLM conditioning.
 
-    Each block is generated sequentially. The MLLM condition for a block
-    is built from prompts and video frames up to the previous block.
+    Each block is generated sequentially. The MLLM condition for each block
+    uses fixed-length query embeddings that encode prompts and video frames
+    visible up to that block.
     """
 
     def __init__(self, device="cuda", torch_dtype=torch.bfloat16):
         super().__init__(device=device, torch_dtype=torch_dtype)
+        self.last_block_videos = []
 
     @staticmethod
     def from_pretrained(
@@ -58,9 +47,10 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
         redirect_common_files: bool = False,
         use_usp: bool = False,
         vram_limit: float = None,
+        num_metaqueries: int = 64,
     ):
-        """Load pretrained models for autoregressive inter inference."""
-        parent_pipe = WanVideoInterPipeline.from_pretrained(
+        """Load pretrained models for autoregressive MetaQuery inference."""
+        parent_pipe = WanVideoInterPipeline_MetaQuery.from_pretrained(
             torch_dtype=torch_dtype,
             device=device,
             model_configs=model_configs,
@@ -71,11 +61,18 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
             vram_limit=vram_limit,
         )
 
-        pipe = WanVideoAutoregressiveInterPipeline(device=device, torch_dtype=torch_dtype)
+        pipe = WanVideoAutoregressiveQueryPipeline(device=device, torch_dtype=torch_dtype)
         for attr in ["tokenizer", "text_encoder", "dit", "vae", "mllm_encoder", "mllm_processor", "scheduler"]:
             if hasattr(parent_pipe, attr):
                 setattr(pipe, attr, getattr(parent_pipe, attr))
         pipe.vram_management_enabled = parent_pipe.vram_management_enabled
+        
+        # Initialize metaquery tokens if not already done
+        if hasattr(pipe, 'mllm_encoder') and pipe.mllm_encoder is not None:
+            if pipe.mllm_encoder.num_metaqueries == 0:
+                pipe.mllm_encoder.num_metaqueries = num_metaqueries
+                pipe.mllm_encoder._init_metaquery_tokens()
+        
         return pipe
 
     def _build_block_info(self, prompt_list: list[str], clip_frames: list[int], num_frames: int) -> list[dict]:
@@ -109,166 +106,112 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
 
         return video_blocks, video_metadata_blocks, sampled_counts
 
-    def _build_mllm_text(self, prompt_list: list[str], block_info: list[dict]) -> str:
-        text_parts = []
-        prev_prompt_idx = None
-        last_prompt_idx = None
-        for block in block_info:
-            prompt_idx = block["prompt_idx"]
-            if prompt_idx != prev_prompt_idx:
-                if text_parts:
-                    text_parts.append(" ")
-                text_parts.append(prompt_list[prompt_idx])
-                prev_prompt_idx = prompt_idx
-            text_parts.append(" <|vision_start|><|video_pad|><|vision_end|>")
-            last_prompt_idx = prompt_idx
-
-        return _MLLM_TEMPLATE + "".join(text_parts)
-
-    def _encode_mllm_with_video(
-        self,
-        prompt_list: list[str],
-        block_info: list[dict],
-        video_blocks: list[list[Image.Image]],
-        video_metadata_blocks: list[dict],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        full_text = self._build_mllm_text(prompt_list, block_info)
-        model_inputs = self.mllm_processor(
-            text=[full_text],
-            videos=video_blocks,
-            padding=True,
-            video_metadata=video_metadata_blocks,
-            return_tensors="pt",
-            do_resize=False,
-            do_sample_frames=False,
-        ).to(self.device)
-        position_ids, _ = self.mllm_encoder.model.get_rope_index(
-            input_ids=model_inputs["input_ids"],
-            video_grid_thw=model_inputs["video_grid_thw"],
-            attention_mask=model_inputs["attention_mask"],
-        )
-        hidden_states = self.mllm_encoder(**model_inputs)[-1]
-        hidden_states = hidden_states[:, _MLLM_DROP_IDX:]
-        input_ids = model_inputs["input_ids"][:, _MLLM_DROP_IDX:]
-        position_ids = position_ids[..., _MLLM_DROP_IDX:]
-        return hidden_states, input_ids, position_ids
-
-    def _build_mllm_mask(
-        self,
-        num_frames: int,
-        height: int,
-        width: int,
-        input_ids: torch.Tensor,
-        block_info: list[dict],
-        sampled_counts: list[int],
-    ) -> tuple[torch.Tensor, int, torch.Tensor]:
-        lat_h = height // 16
-        lat_w = width // 16
-        s_dit = lat_h * lat_w
-        num_dit_frames = 1 + (num_frames - 1) // 4
-        num_dit_tokens = num_dit_frames * s_dit
-        mllm_seq_len = input_ids.shape[1]
-
-        vision_start_token_id = self.mllm_encoder.config.vision_start_token_id
-        vision_end_token_id = self.mllm_encoder.config.vision_end_token_id
-        vision_start_positions = (input_ids[0] == vision_start_token_id).nonzero(as_tuple=True)[0]
-        vision_end_positions = (input_ids[0] == vision_end_token_id).nonzero(as_tuple=True)[0]
-
-        mllm_mask = torch.full(
-            (1, num_dit_tokens),
-            0,
-            device=input_ids.device,
-            dtype=torch.int32,
-        )
-        mllm_vision_ranges = torch.zeros(
-            (1, num_dit_tokens, 2),
-            device=input_ids.device,
-            dtype=torch.int32,
-        )
-
-        text_end = mllm_seq_len
-        if len(vision_start_positions) > 0:
-            text_end = vision_start_positions[0].item()
-
-        vision_seg_offset = 0
-        for block_idx, block in enumerate(block_info):
-            num_sampled = sampled_counts[block_idx] if block_idx < len(sampled_counts) else 0
-            num_vision_segs = num_sampled // 2
-
-            latent_start = block["latent_start"]
-            latent_end = block["latent_end"]
-            start_dit_token = latent_start * s_dit
-            end_dit_token = latent_end * s_dit
-
-            if block_idx == 0:
-                mllm_mask[:, start_dit_token:end_dit_token] = 0
-            elif (
-                len(vision_end_positions) == 0
-                or len(vision_start_positions) == 0
-                or vision_seg_offset <= 0
-            ):
-                mllm_mask[:, start_dit_token:end_dit_token] = 0
-            else:
-                end_pos_idx = min(vision_seg_offset - 1, len(vision_end_positions) - 1)
-                end_mllm_prefix = vision_end_positions[end_pos_idx].item() + 1
-                prefix_end = min(end_mllm_prefix, mllm_seq_len)
-                mllm_mask[:, start_dit_token:end_dit_token] = prefix_end
-
-                vision_range_start = vision_start_positions[0].item()
-                vision_range_end = vision_end_positions[end_pos_idx].item() + 1
-                mllm_vision_ranges[:, start_dit_token:end_dit_token, 0] = vision_range_start
-                mllm_vision_ranges[:, start_dit_token:end_dit_token, 1] = vision_range_end
-
-            vision_seg_offset += num_vision_segs
-
-        return mllm_mask, mllm_seq_len, mllm_vision_ranges
-
-    def encode_mllm_for_block(
+    def encode_mllm_for_block_metaquery(
         self,
         prompt_list: list[str],
         block_info: list[dict],
         generated_video_frames: list[Image.Image],
-        height: int,
-        width: int,
-        num_frames: int,
         current_block: int,
-    ) -> dict:
-        if current_block == 0 or not generated_video_frames:
-            return {}
-
-        prev_blocks = [b for b in block_info if b["global_block_idx"] < current_block]
-        if not prev_blocks:
-            return {}
-
-        max_prev_prompt_idx = max(b["prompt_idx"] for b in prev_blocks)
-        prompt_slice = prompt_list[:max_prev_prompt_idx + 1]
-        video_blocks, video_metadata_blocks, sampled_counts = self._collect_video_blocks(
-            generated_video_frames, prev_blocks, total_num_frames=num_frames
-        )
-        hidden_states, input_ids, position_ids = self._encode_mllm_with_video(
-            prompt_slice, prev_blocks, video_blocks, video_metadata_blocks
-        )
-        current_block_info = next(
-            block for block in block_info if block["global_block_idx"] == current_block
-        )
-        mask_block_info = prev_blocks + [current_block_info]
-        sampled_counts = sampled_counts + [0]
-
-        mllm_mask, mllm_kv_len, mllm_vision_ranges = self._build_mllm_mask(
-            num_frames=num_frames,
-            height=height,
-            width=width,
-            input_ids=input_ids,
-            block_info=mask_block_info,
-            sampled_counts=sampled_counts,
-        )
-        return {
-            "mllm_hidden_states": hidden_states,
-            "mllm_mask": mllm_mask,
-            "mllm_kv_len": mllm_kv_len,
-            "mllm_position_ids": position_ids,
-            "mllm_vision_ranges": mllm_vision_ranges,
-        }
+    ) -> Optional[torch.Tensor]:
+        """Encode MLLM condition for a single block using MetaQuery.
+        
+        Returns:
+            query_embeds: (1, num_metaqueries, hidden_dim) or None
+        """
+        mllm_embedder = WanVideoUnit_MLLMEmbedder_MetaQuery()
+        
+        # Collect video blocks for history (only previous blocks)
+        if current_block > 0:
+            video_blocks, video_metadata_blocks, _ = self._collect_video_blocks(
+                generated_video_frames, block_info[:current_block], 
+                total_num_frames=len(generated_video_frames)
+            )
+        else:
+            video_blocks = []
+            video_metadata_blocks = []
+        
+        # Build query tokens string
+        query_tokens = ["<|begin_of_query|>"]
+        query_tokens.extend([f"<|query_{i}|>" for i in range(self.mllm_encoder.num_metaqueries)])
+        query_tokens.append("<|end_of_query|>")
+        query_str = "".join(query_tokens)
+        
+        # Build full text with history
+        full_text_parts = [f"<|im_start|>system\n{mllm_embedder.system_prompt}<|im_end|>\n"]
+        all_videos = []
+        all_metadata = []
+        
+        prev_prompt_idx = None
+        for block_idx in range(current_block + 1):
+            block = block_info[block_idx]
+            user_content_parts = []
+            prompt_idx = block["prompt_idx"]
+            
+            # Add prompt if changed
+            if prompt_idx != prev_prompt_idx:
+                user_content_parts.append(prompt_list[prompt_idx])
+                prev_prompt_idx = prompt_idx
+            
+            # Add video for previous blocks only
+            if block_idx > 0:
+                if len(user_content_parts) > 0:
+                    user_content_parts.append(" ")
+                user_content_parts.append(" <|vision_start|><|video_pad|><|vision_end|>")
+                all_videos.append(video_blocks[block_idx - 1])
+                all_metadata.append(video_metadata_blocks[block_idx - 1])
+            
+            user_content = "".join(user_content_parts)
+            full_text_parts.append(f"<|im_start|>user\n{user_content}<|im_end|>\n")
+            full_text_parts.append(f"<|im_start|>assistant\n{query_str}<|im_end|>\n")
+        
+        full_text = "".join(full_text_parts)
+        
+        # Process with MLLM
+        if all_videos:
+            model_inputs = self.mllm_processor(
+                text=[full_text],
+                videos=all_videos,
+                padding=True,
+                video_metadata=all_metadata,
+                return_tensors="pt",
+                do_resize=False,
+                do_sample_frames=False
+            ).to(self.device)
+        else:
+            model_inputs = self.mllm_processor(
+                text=[full_text],
+                videos=None,
+                padding=True,
+                return_tensors="pt",
+            ).to(self.device)
+        
+        # Get hidden states
+        hidden_states = self.mllm_encoder(**model_inputs)[-1]
+        input_ids = model_inputs["input_ids"]
+        
+        # Extract query embeddings for current block
+        boq = self.mllm_encoder.boq_token_id
+        eoq = self.mllm_encoder.eoq_token_id
+        if boq is None or eoq is None:
+            raise RuntimeError("MetaQuery tokens are not initialized.")
+        
+        boq_positions = (input_ids[0] == boq).nonzero(as_tuple=True)[0].tolist()
+        eoq_positions = (input_ids[0] == eoq).nonzero(as_tuple=True)[0].tolist()
+        
+        if len(boq_positions) != current_block + 1 or len(eoq_positions) != current_block + 1:
+            raise RuntimeError(
+                f"Expected {current_block + 1} MetaQuery segments, got {len(boq_positions)} BOQ and {len(eoq_positions)} EOQ."
+            )
+        
+        # Get the query embeddings for the current block (last one)
+        b_pos = boq_positions[current_block]
+        e_pos = eoq_positions[current_block]
+        if e_pos <= b_pos:
+            raise RuntimeError("Invalid MetaQuery token positions.")
+        
+        query_embeds = hidden_states[:, b_pos + 1:e_pos, :]
+        
+        return query_embeds
 
     def denoise_block(
         self,
@@ -279,17 +222,14 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
         context_posi: torch.Tensor,
         context_nega: torch.Tensor,
         mllm_embeddings: Optional[torch.Tensor],
-        mllm_mask: Optional[torch.Tensor],
-        mllm_kv_len: Optional[int],
-        mllm_vision_ranges: Optional[torch.Tensor],
         freqs_full: torch.Tensor,
         tokens_per_latent_frame: int,
         use_gradient_checkpointing: bool,
         cfg_scale: float,
-        mllm_cfg_scale: float = 1.0,
         clean_latents_source: Optional[torch.Tensor] = None,
         progress_bar_cmd=tqdm,
     ) -> torch.Tensor:
+        """Denoise a single block using MetaQuery MLLM embeddings."""
         latent_start = block["latent_start"]
         latent_end = block["latent_end"]
         block_latents = full_latents[:, :, latent_start:latent_end].clone()
@@ -308,10 +248,9 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
             t_clean = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, clean_timestep))
             t_mod_clean = dit.time_projection(t_clean).unflatten(1, (6, dit.dim))
 
-            # Use clean_latents_source if provided, otherwise use full_latents
             clean_source = clean_latents_source if clean_latents_source is not None else full_latents
 
-            noise_pred_posi = compute_noise_pred_per_block(
+            noise_pred_posi = compute_noise_pred_per_block_metaquery(
                 dit=dit,
                 block_idx=block["global_block_idx"],
                 block_info=block,
@@ -325,67 +264,31 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                 t_clean=t_clean,
                 t_mod_clean=t_mod_clean,
                 mllm_embeddings=mllm_embeddings,
-                mllm_mask_full=mllm_mask,
-                mllm_vision_ranges=mllm_vision_ranges,
-                mllm_kv_len=mllm_kv_len,
                 tokens_per_latent_frame=tokens_per_latent_frame,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 device=self.device,
             )
 
-            w_t = cfg_scale - 1.0
-            w_m = mllm_cfg_scale - 1.0
-
-            if w_t != 0.0 or w_m != 0.0:
-                noise_pred_nega = noise_pred_posi
-                if w_t != 0.0:
-                    noise_pred_nega = compute_noise_pred_per_block(
-                        dit=dit,
-                        block_idx=block["global_block_idx"],
-                        block_info=block,
-                        x_full=full_latents,
-                        input_latents=None,
-                        clean_input_latents=clean_source,
-                        freqs_full=freqs_full,
-                        context_per_block={block["global_block_idx"]: context_nega},
-                        t=t,
-                        t_mod=t_mod,
-                        t_clean=t_clean,
-                        t_mod_clean=t_mod_clean,
-                        mllm_embeddings=mllm_embeddings,
-                        mllm_mask_full=mllm_mask,
-                        mllm_vision_ranges=mllm_vision_ranges,
-                        mllm_kv_len=mllm_kv_len,
-                        tokens_per_latent_frame=tokens_per_latent_frame,
-                        use_gradient_checkpointing=use_gradient_checkpointing,
-                        device=self.device,
-                    )
-
-                noise_pred_text_only = noise_pred_posi
-                if w_m != 0.0:
-                    noise_pred_text_only = compute_noise_pred_per_block(
-                        dit=dit,
-                        block_idx=block["global_block_idx"],
-                        block_info=block,
-                        x_full=full_latents,
-                        input_latents=None,
-                        clean_input_latents=clean_source,
-                        freqs_full=freqs_full,
-                        context_per_block={block["global_block_idx"]: context_posi},
-                        t=t,
-                        t_mod=t_mod,
-                        t_clean=t_clean,
-                        t_mod_clean=t_mod_clean,
-                        mllm_embeddings=None,
-                        mllm_mask_full=None,
-                        mllm_vision_ranges=None,
-                        mllm_kv_len=None,
-                        tokens_per_latent_frame=tokens_per_latent_frame,
-                        use_gradient_checkpointing=use_gradient_checkpointing,
-                        device=self.device,
-                    )
-
-                noise_pred = (1.0 + w_t + w_m) * noise_pred_posi - w_t * noise_pred_nega - w_m * noise_pred_text_only
+            if cfg_scale != 1.0:
+                noise_pred_nega = compute_noise_pred_per_block_metaquery(
+                    dit=dit,
+                    block_idx=block["global_block_idx"],
+                    block_info=block,
+                    x_full=full_latents,
+                    input_latents=None,
+                    clean_input_latents=clean_source,
+                    freqs_full=freqs_full,
+                    context_per_block={block["global_block_idx"]: context_nega},
+                    t=t,
+                    t_mod=t_mod,
+                    t_clean=t_clean,
+                    t_mod_clean=t_mod_clean,
+                    mllm_embeddings=mllm_embeddings,
+                    tokens_per_latent_frame=tokens_per_latent_frame,
+                    use_gradient_checkpointing=use_gradient_checkpointing,
+                    device=self.device,
+                )
+                noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
             else:
                 noise_pred = noise_pred_posi
 
@@ -415,7 +318,6 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
         use_gt_vae: bool = False,
         gt_decode: bool = True,
         cfg_scale: Optional[float] = 5.0,
-        mllm_cfg_scale: Optional[float] = 1.0,
         num_inference_steps: Optional[int] = 50,
         sigma_shift: Optional[float] = 5.0,
         tiled: Optional[bool] = True,
@@ -445,9 +347,10 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
         num_dit_frames = 1 + (num_frames - 1) // 4
         self.last_block_videos = []
 
-        print("=== Autoregressive Inter Video Generation ===")
+        print("=== Autoregressive MetaQuery Video Generation ===")
         print(f"Video: {width}x{height}, {num_frames} frames ({num_dit_frames} latent frames)")
         print(f"Blocks: {num_blocks} (BLOCK_DURATION={BLOCK_DURATION})")
+        print(f"MetaQuery tokens: {self.mllm_encoder.num_metaqueries}")
 
         self.scheduler.set_timesteps(num_inference_steps, shift=sigma_shift)
 
@@ -503,35 +406,23 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
             print(f"  MLLM context: {len(generated_video_frames)} frames from previous blocks")
 
             mllm_embeddings = None
-            mllm_mask = None
-            mllm_kv_len = None
-            mllm_vision_ranges = None
 
-            if use_mllm_condition and block_idx > 0:
+            if use_mllm_condition:
                 self.load_models_to_device(["mllm_encoder"])
-                mllm_output = self.encode_mllm_for_block(
+                query_embeds = self.encode_mllm_for_block_metaquery(
                     prompt_list=prompt_list,
                     block_info=block_info,
                     generated_video_frames=generated_video_frames,
-                    height=height,
-                    width=width,
-                    num_frames=num_frames,
                     current_block=block_idx,
                 )
 
-                if (
-                    mllm_output.get("mllm_hidden_states") is not None
-                    and hasattr(self.dit, "has_mllm_input")
-                    and self.dit.has_mllm_input
-                ):
+                if query_embeds is not None and hasattr(self.dit, "has_mllm_input") and self.dit.has_mllm_input:
                     self.load_models_to_device(self.in_iteration_models)
-                    mllm_mask = mllm_output["mllm_mask"]
-                    mllm_kv_len = mllm_output["mllm_kv_len"]
-                    mllm_vision_ranges = mllm_output.get("mllm_vision_ranges")
+                    # Process through DiT's mllm_embedding (bidirectional attention)
                     mllm_embeddings = self.dit.mllm_embedding(
-                        mllm_output["mllm_hidden_states"],
-                        position_ids=mllm_output["mllm_position_ids"],
-                        mllm_mask=mllm_mask,
+                        query_embeds,
+                        position_ids=None,
+                        mllm_mask=None,
                     )
 
             self.load_models_to_device(self.in_iteration_models)
@@ -545,14 +436,10 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                 context_posi=context_posi,
                 context_nega=context_nega,
                 mllm_embeddings=mllm_embeddings,
-                mllm_mask=mllm_mask,
-                mllm_kv_len=mllm_kv_len,
-                mllm_vision_ranges=mllm_vision_ranges,
                 freqs_full=freqs_full,
                 tokens_per_latent_frame=tokens_per_latent_frame,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 cfg_scale=cfg_scale,
-                mllm_cfg_scale=mllm_cfg_scale,
                 clean_latents_source=input_video_latents,
                 progress_bar_cmd=progress_bar_cmd,
             )
