@@ -45,13 +45,19 @@ class ModelLogger:
         if self.use_wandb and self.wandb_initialized:
             self.wandb.log(metrics, step=self.num_steps)
 
-    def on_step_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None, loss=None, epoch=0):
+    def on_step_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None, loss=None, grad_norm=None, epoch=0):
         self.num_steps += 1
         self.current_epoch = epoch
         
-        # Log loss to wandb
-        if loss is not None and accelerator.is_main_process:
-            self.log_metrics({"train/loss": loss.item() if isinstance(loss, torch.Tensor) else loss})
+        # Log metrics to wandb
+        if accelerator.is_main_process:
+            metrics = {}
+            if loss is not None:
+                metrics["train/loss"] = loss.item() if isinstance(loss, torch.Tensor) else loss
+            if grad_norm is not None:
+                metrics["train/grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            if metrics:
+                self.log_metrics(metrics)
         
         if save_steps is not None and self.num_steps % save_steps == 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")

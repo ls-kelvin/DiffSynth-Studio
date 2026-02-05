@@ -127,6 +127,13 @@ def launch_training_task(
                 accumulated_loss += loss_detached
                 micro_steps += 1
                 accelerator.backward(loss)
+                
+                # Calculate gradient norm before optimizer.step()
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+                else:
+                    grad_norm = None
+                
                 optimizer.step()
                 scheduler.step()
                 # Only log to wandb once per full (global) batch, but keep num_steps unchanged
@@ -140,7 +147,7 @@ def launch_training_task(
                 else:
                     log_loss = None
                     loss_to_report = loss_detached
-                model_logger.on_step_end(accelerator, model, save_steps, loss=log_loss, epoch=epoch_id)
+                model_logger.on_step_end(accelerator, model, save_steps, loss=log_loss, grad_norm=grad_norm, epoch=epoch_id)
                 loss_val = loss_to_report.item() if isinstance(loss_to_report, torch.Tensor) else float(loss_to_report)
                 pbar.set_postfix({"loss": f"{loss_val:.6f}"})
         if save_steps is None:

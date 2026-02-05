@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 from einops import rearrange
 from .wan_video_camera_controller import SimpleAdapter
 from transformers.masking_utils import create_causal_mask
@@ -98,6 +98,17 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     return (x * (1 + scale) + shift)
 
 
+def _normalize_mllm_mode(has_mllm_input: Union[bool, str]) -> Optional[str]:
+    if isinstance(has_mllm_input, str):
+        mode = has_mllm_input.strip().lower()
+        if mode in ("", "none", "false", "0"):
+            return None
+        if mode in ("concat_kv", "kv_concat", "concat", "concat_kv_t5", "kv_concat_t5"):
+            return "concat_kv"
+        return "mllm_cross"
+    return "mllm_cross" if has_mllm_input else None
+
+
 def sinusoidal_embedding_1d(dim, position):
     sinusoid = torch.outer(position.type(torch.float64), torch.pow(
         10000, -torch.arange(dim//2, dtype=torch.float64, device=position.device).div(dim//2)))
@@ -188,7 +199,14 @@ class SelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6, has_image_input: bool = False, has_mllm_input: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        has_image_input: bool = False,
+        has_mllm_input: Union[bool, str] = False,
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -201,11 +219,16 @@ class CrossAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
         self.has_image_input = has_image_input
-        self.has_mllm_input = has_mllm_input
+        self.mllm_mode = _normalize_mllm_mode(has_mllm_input)
+        self.has_mllm_input = self.mllm_mode is not None
         if has_image_input:
             self.k_img = nn.Linear(dim, dim)
             self.v_img = nn.Linear(dim, dim)
             self.norm_k_img = RMSNorm(dim, eps=eps)
+        if self.mllm_mode == "concat_kv":
+            self.k_mllm = nn.Linear(dim, dim)
+            self.v_mllm = nn.Linear(dim, dim)
+            self.norm_k_mllm = RMSNorm(dim, eps=eps)
             
         self.attn = AttentionModule(self.num_heads)
         
@@ -214,6 +237,7 @@ class CrossAttention(nn.Module):
         self,
         x: torch.Tensor,
         y: torch.Tensor,
+        mllm_embeddings: Optional[torch.Tensor] = None,
         q_mask: Optional[torch.Tensor] = None,
     ):
         if self.has_image_input:
@@ -227,7 +251,14 @@ class CrossAttention(nn.Module):
         # T5 cross-attention
         k_t5 = self.norm_k(self.k(ctx))
         v_t5 = self.v(ctx)
-        x_t5 = self.attn(q, k_t5, v_t5)
+        if self.mllm_mode == "concat_kv" and mllm_embeddings is not None:
+            k_mllm = self.norm_k_mllm(self.k_mllm(mllm_embeddings))
+            v_mllm = self.v_mllm(mllm_embeddings)
+            k_cat = torch.cat([k_t5, k_mllm], dim=1)
+            v_cat = torch.cat([v_t5, v_mllm], dim=1)
+            x_t5 = self.attn(q, k_cat, v_cat)
+        else:
+            x_t5 = self.attn(q, k_t5, v_t5)
 
         x = x_t5
 
@@ -318,17 +349,26 @@ class GateModule(nn.Module):
         return x + gate * residual
 
 class DiTBlock(nn.Module):
-    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6, has_mllm_input: bool = False):
+    def __init__(
+        self,
+        has_image_input: bool,
+        dim: int,
+        num_heads: int,
+        ffn_dim: int,
+        eps: float = 1e-6,
+        has_mllm_input: Union[bool, str] = False,
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
-        self.has_mllm_input = has_mllm_input
+        self.mllm_mode = _normalize_mllm_mode(has_mllm_input)
+        self.has_mllm_input = self.mllm_mode is not None
 
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(
             dim, num_heads, eps, has_image_input=has_image_input, has_mllm_input=has_mllm_input)
-        if has_mllm_input:
+        if self.mllm_mode == "mllm_cross":
             self.cross_attn2 = MLLMCrossAttention(dim, num_heads, eps)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -369,8 +409,11 @@ class DiTBlock(nn.Module):
 
         # x = x + self.cross_attn + self.cross_attn2 (cross_attn2 initialized to zero)
         norm_x = self.norm3(x)
-        x = x + self.cross_attn(norm_x, context, q_mask=cross_attn_q_mask)
-        if self.has_mllm_input and (mllm_embeddings is not None):
+        mllm_for_cross = None
+        if self.mllm_mode == "concat_kv" and (mllm_embeddings is not None) and (not mllm_zero_out):
+            mllm_for_cross = mllm_embeddings
+        x = x + self.cross_attn(norm_x, context, mllm_embeddings=mllm_for_cross, q_mask=cross_attn_q_mask)
+        if self.mllm_mode == "mllm_cross" and (mllm_embeddings is not None):
             mllm_out = self.cross_attn2(
                 norm_x,
                 mllm_embeddings,
@@ -571,7 +614,7 @@ class WanModel(torch.nn.Module):
         require_vae_embedding: bool = True,
         require_clip_embedding: bool = True,
         fuse_vae_embedding_in_latents: bool = False,
-        has_mllm_input: bool = False,
+        has_mllm_input: Union[bool, str] = False,
         mllm_embed_num_layers: int = 4,
     ):
         super().__init__()
@@ -593,8 +636,9 @@ class WanModel(torch.nn.Module):
             nn.GELU(approximate='tanh'),
             nn.Linear(dim, dim)
         )
-        self.has_mllm_input = has_mllm_input
-        if has_mllm_input:
+        self.mllm_mode = _normalize_mllm_mode(has_mllm_input)
+        self.has_mllm_input = self.mllm_mode is not None
+        if self.has_mllm_input:
             # Adapt MLLM hidden states via lightweight Qwen3VL text layers, then map to model dim.
             self.mllm_embedding = Qwen3VLMllmEmbedding(dim, num_layers=mllm_embed_num_layers)
         self.time_embedding = nn.Sequential(
@@ -678,7 +722,8 @@ class WanModel(torch.nn.Module):
         # Build flex block_mask once (if flex available) for cross-attn
         mllm_block_mask = None
         if (
-            USE_FLEX_ATTENTION
+            self.mllm_mode == "mllm_cross"
+            and USE_FLEX_ATTENTION
             and create_block_mask is not None
             and mllm_embeddings is not None
             and mllm_mask is not None
@@ -782,7 +827,7 @@ class WanModel(torch.nn.Module):
             # Check if cross_attn2 is missing and cross_attn exists
             has_cross_attn2 = any("cross_attn2" in k for k in state_dict.keys())
             
-            if not has_cross_attn2 and self.has_mllm_input:
+            if not has_cross_attn2 and self.mllm_mode == "mllm_cross":
                 # Initialize cross_attn2 from cross_attn for each block
                 new_keys = {}
                 for key, value in state_dict.items():
