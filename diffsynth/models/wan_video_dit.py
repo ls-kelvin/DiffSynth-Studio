@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Tuple, Optional, Union
+from typing import Tuple, Optional, Union, Dict, Any
 from einops import rearrange
 from .wan_video_camera_controller import SimpleAdapter
 from transformers.masking_utils import create_causal_mask
@@ -111,6 +111,20 @@ def _normalize_mllm_mode(mllm_mode: Optional[Union[bool, str]]) -> Optional[str]
             return "decoupled_kv"
         return "mllm_cross"
     return "mllm_cross" if mllm_mode else None
+
+
+def _to_timestep_stat_key(timestep: Optional[torch.Tensor]) -> Optional[Union[int, float]]:
+    if timestep is None:
+        return None
+    if isinstance(timestep, torch.Tensor):
+        if timestep.numel() == 0:
+            return None
+        value = float(timestep.detach().reshape(-1)[0].item())
+    else:
+        value = float(timestep)
+    if abs(value - round(value)) < 1e-6:
+        return int(round(value))
+    return round(value, 6)
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -242,6 +256,9 @@ class CrossAttention(nn.Module):
         y: torch.Tensor,
         mllm_embeddings: Optional[torch.Tensor] = None,
         q_mask: Optional[torch.Tensor] = None,
+        current_block_idx: Optional[int] = None,
+        current_timestep: Optional[torch.Tensor] = None,
+        norm_stats: Optional[Dict[Any, Dict[str, float]]] = None,
     ):
         if self.has_image_input:
             img = y[:, :257]
@@ -277,6 +294,21 @@ class CrossAttention(nn.Module):
             k_mllm = self.norm_k_mllm(self.k_mllm(mllm_embeddings))
             v_mllm = self.v_mllm(mllm_embeddings)
             y_mllm = flash_attention(q, k_mllm, v_mllm, num_heads=self.num_heads)
+            if norm_stats is not None and current_block_idx is not None:
+                timestep_key = _to_timestep_stat_key(current_timestep)
+                if timestep_key is not None:
+                    x_norm = torch.linalg.vector_norm(x.detach().float().flatten(start_dim=1), dim=1).mean().item()
+                    y_norm = torch.linalg.vector_norm(y_mllm.detach().float().flatten(start_dim=1), dim=1).mean().item()
+                    stat_key = (int(current_block_idx), timestep_key)
+                    if stat_key not in norm_stats:
+                        norm_stats[stat_key] = {
+                            "x_l2_sum": 0.0,
+                            "y_mllm_l2_sum": 0.0,
+                            "count": 0.0,
+                        }
+                    norm_stats[stat_key]["x_l2_sum"] += float(x_norm)
+                    norm_stats[stat_key]["y_mllm_l2_sum"] += float(y_norm)
+                    norm_stats[stat_key]["count"] += 1.0
             x = x + y_mllm
             
         x = self.o(x)
@@ -419,9 +451,20 @@ class DiTBlock(nn.Module):
         # x = x + self.cross_attn + self.cross_attn2 (cross_attn2 initialized to zero)
         norm_x = self.norm3(x)
         mllm_for_cross = None
+        current_block_idx = getattr(self, "_current_block_idx", None)
+        current_timestep = getattr(self, "_current_timestep", None)
+        norm_stats = getattr(self, "_norm_stats", None)
         if self.mllm_mode is not None and "kv" in self.mllm_mode and (mllm_embeddings is not None) and (not mllm_zero_out):
             mllm_for_cross = mllm_embeddings
-        x = x + self.cross_attn(norm_x, context, mllm_embeddings=mllm_for_cross, q_mask=cross_attn_q_mask)
+        x = x + self.cross_attn(
+            norm_x,
+            context,
+            mllm_embeddings=mllm_for_cross,
+            q_mask=cross_attn_q_mask,
+            current_block_idx=current_block_idx,
+            current_timestep=current_timestep,
+            norm_stats=norm_stats,
+        )
         if self.mllm_mode == "mllm_cross" and (mllm_embeddings is not None):
             mllm_out = self.cross_attn2(
                 norm_x,
@@ -686,6 +729,28 @@ class WanModel(torch.nn.Module):
             self.control_adapter = None
 
         self.init_load = 0
+        self.cross_attn_norm_stats: Dict[Any, Dict[str, float]] = {}
+
+    def reset_cross_attn_norm_stats(self):
+        self.cross_attn_norm_stats = {}
+
+    def get_cross_attn_norm_stats(self):
+        records = []
+        for (block_idx, timestep), payload in sorted(
+            self.cross_attn_norm_stats.items(),
+            key=lambda kv: (int(kv[0][0]), float(kv[0][1])),
+        ):
+            count = max(float(payload.get("count", 0.0)), 1.0)
+            records.append(
+                {
+                    "block_idx": int(block_idx),
+                    "timestep": timestep,
+                    "x_l2_mean": float(payload.get("x_l2_sum", 0.0)) / count,
+                    "y_mllm_l2_mean": float(payload.get("y_mllm_l2_sum", 0.0)) / count,
+                    "samples": int(payload.get("count", 0.0)),
+                }
+            )
+        return records
 
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
         x = self.patch_embedding(x)
@@ -796,6 +861,9 @@ class WanModel(torch.nn.Module):
             )
 
         for block in self.blocks:
+            block._current_block_idx = None
+            block._current_timestep = timestep
+            block._norm_stats = self.cross_attn_norm_stats
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():

@@ -545,6 +545,7 @@ def compute_noise_pred_per_block(
     use_gradient_checkpointing: bool,
     device: torch.device,
     mllm_cfg_drop: float = 0.0,
+    timestep_value: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Use torch.rand instead of random.random() for distributed training consistency
     latent_start = block_info["latent_start"]
@@ -695,6 +696,9 @@ def compute_noise_pred_per_block(
         return custom_forward
     
     for dit_block in dit.blocks:
+        dit_block._current_block_idx = block_idx
+        dit_block._current_timestep = timestep_value
+        dit_block._norm_stats = getattr(dit, "cross_attn_norm_stats", None)
         if use_gradient_checkpointing:
             x_input = torch.utils.checkpoint.checkpoint(
                 create_custom_forward(dit_block),
@@ -960,6 +964,7 @@ def compute_noise_pred_per_block_metaquery(
     use_gradient_checkpointing: bool,
     device: torch.device,
     mllm_cfg_drop: float = 0.0,
+    timestep_value: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """MetaQuery 版本的 compute_noise_pred_per_block，移除了 mask 相关代码"""
     latent_start = block_info["latent_start"]
@@ -1064,6 +1069,9 @@ def compute_noise_pred_per_block_metaquery(
         return custom_forward
     
     for dit_block in dit.blocks:
+        dit_block._current_block_idx = block_idx
+        dit_block._current_timestep = timestep_value
+        dit_block._norm_stats = getattr(dit, "cross_attn_norm_stats", None)
         if use_gradient_checkpointing:
             x_input = torch.utils.checkpoint.checkpoint(
                 create_custom_forward(dit_block),

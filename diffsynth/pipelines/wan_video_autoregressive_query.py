@@ -267,6 +267,7 @@ class WanVideoAutoregressiveQueryPipeline(WanVideoInterPipeline_MetaQuery):
                 tokens_per_latent_frame=tokens_per_latent_frame,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 device=self.device,
+                timestep_value=timestep,
             )
 
             if cfg_scale != 1.0:
@@ -287,6 +288,7 @@ class WanVideoAutoregressiveQueryPipeline(WanVideoInterPipeline_MetaQuery):
                     tokens_per_latent_frame=tokens_per_latent_frame,
                     use_gradient_checkpointing=use_gradient_checkpointing,
                     device=self.device,
+                    timestep_value=timestep,
                 )
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
             else:

@@ -13,8 +13,8 @@ import torch
 from accelerate import Accelerator
 
 from diffsynth.utils.data import save_video
-from diffsynth.pipelines.wan_video_autoregressive_inter import (
-    WanVideoAutoregressiveInterPipeline,
+from diffsynth.pipelines.wan_video_autoregressive_query import (
+    WanVideoAutoregressiveQueryPipeline,
     ModelConfig,
 )
 from diffsynth.core.data.unified_dataset import WanVideoInterDataset
@@ -48,6 +48,60 @@ def parse_args():
     return parser.parse_args()
 
 
+def load_lora_weights(pipe, lora_path, device, rank=0):
+    """
+    加载LoRA权重到pipeline中。
+    
+    Args:
+        pipe: WanVideoAutoregressiveQueryPipeline实例
+        lora_path: LoRA权重文件的完整路径
+        device: 计算设备
+        rank: 当前进程rank，用于打印信息
+    
+    Returns:
+        bool: 是否成功加载
+    """
+    if lora_path is None or lora_path == "":
+        if rank == 0:
+            print("⚠️  LoRA path is empty, skipping LoRA loading.")
+        return False
+    
+    if not os.path.exists(lora_path):
+        if rank == 0:
+            print(f"⚠️  LoRA file not found: {lora_path}, skipping.")
+        return False
+    
+    try:
+        state_dict = load_state_dict(lora_path, torch_dtype=pipe.torch_dtype, device=device)
+        
+        # 分离DiT和MLLM的权重
+        dit_state_dict = {k.replace("dit.", ""): v for k, v in state_dict.items() if k.startswith("dit.")}
+        mllm_state_dict = {k.replace("mllm_encoder.", ""): v for k, v in state_dict.items() if k.startswith("mllm_encoder.")}
+        
+        # 如果没有找到dit.前缀的权重，尝试直接使用（兼容旧格式）
+        if len(dit_state_dict) == 0:
+            print("DiT is empty!")
+            dit_state_dict = {k: v for k, v in state_dict.items() if not k.startswith("mllm_encoder.")}
+            if rank == 0:
+                for k in state_dict.keys():
+                    print(k, end=",")
+        
+        # 加载到模型
+        pipe.dit.load_state_dict(dit_state_dict, strict=False)
+        pipe.mllm_encoder.load_state_dict(mllm_state_dict, strict=False)
+        pipe.load_lora(pipe.dit, state_dict=dit_state_dict, alpha=1.0)
+        
+        if rank == 0:
+            print(f"✅ LoRA loaded: {lora_path}")
+        
+        return True
+        
+    except Exception as e:
+        if rank == 0:
+            print(f"❌ Failed to load LoRA from {lora_path}: {e}")
+        return False
+
+
 def main():
     args = parse_args()
     accelerator = Accelerator()
@@ -75,7 +129,7 @@ def main():
     indices = list(range(rank, total_items, world_size))
     accelerator.print(f"[Rank {rank}] Assigned {len(indices)} / {total_items} items.")
 
-    pipe = WanVideoAutoregressiveInterPipeline.from_pretrained(
+    pipe = WanVideoAutoregressiveQueryPipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device=accelerator.device,
         model_configs=[
@@ -90,24 +144,17 @@ def main():
         tokenizer_config=ModelConfig(path="/root/workspace/zzt/models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl"),
         mllm_processor_config=ModelConfig(path="/root/workspace/zzt/models/Qwen/Qwen3-VL-4B-Instruct"),
     )
+    
+    pre_load_path = "/root/workspace/zzt/Diff5/models/train2/Wan2.1-T2V-1.3B_lora_agibot-alpha_mllm_4/step-15200.safetensors"
+    load_lora_weights(pipe, pre_load_path, accelerator.device, rank)
 
-    # Load LoRA
-    lora_path = f"./models/train2/Wan2.1-T2V-1.3B_lora_agibot-alpha_{args.run_cate}/step-{args.lora_step}.safetensors"
+    # 在外部构造LoRA路径，然后传入加载函数
     if args.lora_step != 0:
-        state_dict = load_state_dict(lora_path, torch_dtype=pipe.torch_dtype, device=accelerator.device)
-        dit_state_dict = {k.replace("dit.", ""): v for k, v in state_dict.items() if k.startswith("dit.")}
-        mllm_state_dict = {k.replace("mllm_encoder.", ""): v for k, v in state_dict.items() if k.startswith("mllm_encoder.")}
-        if len(dit_state_dict) == 0:
-            print("DiT is empty!")
-            dit_state_dict = {k: v for k, v in state_dict.items() if not k.startswith("mllm_encoder.")}
-            if rank == 0:
-                for k in state_dict.keys():
-                    print(k, end=",")
-        pipe.dit.load_state_dict(dit_state_dict, strict=False)
-        pipe.mllm_encoder.load_state_dict(mllm_state_dict, strict=False)
-        pipe.load_lora(pipe.dit, state_dict=dit_state_dict, alpha=1.0)
+        lora_path = f"./models/train2/Wan2.1-T2V-1.3B_lora_agibot-alpha_{args.run_cate}/step-{args.lora_step}.safetensors"
+        load_lora_weights(pipe, lora_path, accelerator.device, rank)
+    else:
         if rank == 0:
-            print(f"✅ LoRA loaded: {lora_path}")
+            print("⚠️  lora_step is 0, skipping LoRA loading.")
 
     output_dir = args.output_dir or f"output_videos/{args.lora_step}/{args.run_cate}"
     os.makedirs(output_dir, exist_ok=True)
