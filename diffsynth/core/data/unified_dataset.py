@@ -248,18 +248,28 @@ class WanVideoInterDataset(UnifiedDataset):
                 prompt_list, clip_frames, max_frames
             )
             video_path = self._resolve_path(data["input"]["path"])
-            desired_num_frames = sum(clip_frames)
-            video_loader = LoadVideo(
-                num_frames=desired_num_frames,
-                time_division_factor=self.time_division_factor,
-                time_division_remainder=self.time_division_remainder,
-                frame_processor=self.frame_processor,
-                fps=self.target_fps,
-            )
-            video = video_loader(video_path)
-            clip_frames = self._adjust_clip_frames(clip_frames, len(video))
-            data["video"] = video
-            data["video_id"] = "-".join(data["input"]["path"].split("/")[-4:-2])
+            if os.path.exists(video_path):
+                try:
+                    desired_num_frames = sum(clip_frames)
+                    video_loader = LoadVideo(
+                        num_frames=desired_num_frames,
+                        time_division_factor=self.time_division_factor,
+                        time_division_remainder=self.time_division_remainder,
+                        frame_processor=self.frame_processor,
+                        fps=self.target_fps,
+                    )
+                    video = video_loader(video_path)
+                except Exception as e:
+                    # 保留原始日志风格（你熟悉 FFmpeg 日志，可加详细信息）
+                    print(f"[Fallback] Failed to load video at index {data_id}: {e}")
+                    # 随机选另一个索引，重新调用 __getitem__
+                    new_index = random.randint(0, len(self.data) - 1)
+                    return self.__getitem__(new_index)
+                clip_frames = self._adjust_clip_frames(clip_frames, len(video))
+                data["video"] = video
+                data["video_id"] = "-".join(data["input"]["path"].split("/")[-4:-2])
+            else:
+                data["video_id"] = data["input"]["path"].split("/")[-1].removesuffix(".mp4")
             data["prompt_list"] = prompt_list
             data["clip_frames"] = clip_frames
             return data

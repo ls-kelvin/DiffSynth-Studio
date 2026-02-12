@@ -150,7 +150,7 @@ class WanMLLMQueryTrainingModule(DiffusionTrainingModule):
             if dit_model is None:
                 return enabled
             for name, param in dit_model.named_parameters():
-                if any(key in name for key in ["mllm_embedding", "cross_attn2"]):
+                if any(key in name for key in ["mllm"]):
                     param.requires_grad = True
                     enabled.append(name)
             if enabled:
@@ -160,7 +160,11 @@ class WanMLLMQueryTrainingModule(DiffusionTrainingModule):
         enabled_params = []
         for model_name in ["dit", "dit2"]:
             if hasattr(pipe, model_name):
-                enabled_params.extend(enable_mllm_params(getattr(pipe, model_name)))
+                dit_model = getattr(pipe, model_name)
+                if model_name in trainable_models:
+                    for param in dit_model.parameters():
+                        param.requires_grad = False
+                enabled_params.extend(enable_mllm_params(dit_model))
 
         if enabled_params:
             print(f"Enabled full finetuning for {len(enabled_params)} MLLM parameters in DiT.")

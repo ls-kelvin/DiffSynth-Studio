@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("--gt_decode", action=argparse.BooleanOptionalAction, default=True, help="Decode with GT prefix latents when saving prompt-switch videos")
     parser.add_argument("--tiled", action="store_true")
     parser.add_argument("--cfg_scale", type=float, default=5.0)
+    parser.add_argument("--mllm_cfg_scale", type=float, default=1.0)
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--sigma_shift", type=float, default=5.0)
     parser.add_argument("--target_fps", type=int, default=6)
@@ -95,6 +96,12 @@ def main():
         state_dict = load_state_dict(lora_path, torch_dtype=pipe.torch_dtype, device=accelerator.device)
         dit_state_dict = {k.replace("dit.", ""): v for k, v in state_dict.items() if k.startswith("dit.")}
         mllm_state_dict = {k.replace("mllm_encoder.", ""): v for k, v in state_dict.items() if k.startswith("mllm_encoder.")}
+        if len(dit_state_dict) == 0:
+            print("DiT is empty!")
+            dit_state_dict = {k: v for k, v in state_dict.items() if not k.startswith("mllm_encoder.")}
+            if rank == 0:
+                for k in state_dict.keys():
+                    print(k, end=",")
         pipe.dit.load_state_dict(dit_state_dict, strict=False)
         pipe.mllm_encoder.load_state_dict(mllm_state_dict, strict=False)
         pipe.load_lora(pipe.dit, state_dict=dit_state_dict, alpha=1.0)
@@ -120,14 +127,12 @@ def main():
         #     for frame in input_video
         # ]
 
-        if not prompt_list or not clip_frames or input_video is None:
+        if not prompt_list or not clip_frames:
             accelerator.print(f"❌ [Rank {rank}] Missing fields for item {idx}")
             continue
 
         negative_prompt_list = [NEG_PROMPT] * len(prompt_list)
-        height = input_video[0].size[1]
-        width = input_video[0].size[0]
-        num_frames = len(input_video)
+        num_frames = sum(clip_frames)
 
         try:
             output_video = pipe(
@@ -136,21 +141,22 @@ def main():
                 clip_frames=clip_frames,
                 input_video=input_video if (args.use_gt_mllm or args.use_gt_vae) else None,
                 seed=args.seed,
-                height=height,
-                width=width,
+                height=args.height,
+                width=args.width,
                 num_frames=num_frames,
                 use_mllm_condition=not args.disable_mllm,
                 use_gt_mllm=args.use_gt_mllm,
                 use_gt_vae=args.use_gt_vae,
                 gt_decode=args.gt_decode,
                 cfg_scale=args.cfg_scale,
+                # mllm_cfg_scale=args.mllm_cfg_scale,
                 num_inference_steps=args.num_inference_steps,
                 sigma_shift=args.sigma_shift,
                 tiled=args.tiled,
             )
 
             video_id = item["video_id"]
-            filename = f"{video_id}_ar_inter.mp4"
+            filename = f"{video_id}_ar_inter_mark.mp4"
             save_path = os.path.join(output_dir, filename)
 
             counter = 1

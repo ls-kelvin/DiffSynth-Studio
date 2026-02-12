@@ -1,7 +1,7 @@
 import torch, os, argparse, accelerate, warnings
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.data import WanVideoInterDataset
-from diffsynth.pipelines.wan_video_inter_3 import WanVideoInterPipeline, ModelConfig
+from diffsynth.pipelines.wan_video_inter_4 import WanVideoInterPipeline, ModelConfig
 from diffsynth.diffusion import *
 import random
 random.seed(42)

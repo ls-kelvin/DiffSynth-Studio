@@ -98,15 +98,19 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     return (x * (1 + scale) + shift)
 
 
-def _normalize_mllm_mode(has_mllm_input: Union[bool, str]) -> Optional[str]:
-    if isinstance(has_mllm_input, str):
-        mode = has_mllm_input.strip().lower()
+def _normalize_mllm_mode(mllm_mode: Optional[Union[bool, str]]) -> Optional[str]:
+    if mllm_mode is None:
+        return None
+    if isinstance(mllm_mode, str):
+        mode = mllm_mode.strip().lower()
         if mode in ("", "none", "false", "0"):
             return None
         if mode in ("concat_kv", "kv_concat", "concat", "concat_kv_t5", "kv_concat_t5"):
             return "concat_kv"
+        if mode in ("decoupled_kv", "kv_decoupled", "decoupled", "decoupled_kv_t5", "kv_decoupled_t5"):
+            return "decoupled_kv"
         return "mllm_cross"
-    return "mllm_cross" if has_mllm_input else None
+    return "mllm_cross" if mllm_mode else None
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -205,7 +209,7 @@ class CrossAttention(nn.Module):
         num_heads: int,
         eps: float = 1e-6,
         has_image_input: bool = False,
-        has_mllm_input: Union[bool, str] = False,
+        mllm_mode: Optional[str] = None,
     ):
         super().__init__()
         self.dim = dim
@@ -219,13 +223,12 @@ class CrossAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
         self.has_image_input = has_image_input
-        self.mllm_mode = _normalize_mllm_mode(has_mllm_input)
-        self.has_mllm_input = self.mllm_mode is not None
+        self.mllm_mode = _normalize_mllm_mode(mllm_mode)
         if has_image_input:
             self.k_img = nn.Linear(dim, dim)
             self.v_img = nn.Linear(dim, dim)
             self.norm_k_img = RMSNorm(dim, eps=eps)
-        if self.mllm_mode == "concat_kv":
+        if self.mllm_mode is not None and "kv" in self.mllm_mode:
             self.k_mllm = nn.Linear(dim, dim)
             self.v_mllm = nn.Linear(dim, dim)
             self.norm_k_mllm = RMSNorm(dim, eps=eps)
@@ -268,6 +271,13 @@ class CrossAttention(nn.Module):
             v_img = self.v_img(img)
             y_img = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
             x = x + y_img
+
+        # MLLM cross-attention (if in mllm_cross mode and available, otherwise rely on separate MLLMCrossAttention)
+        if self.mllm_mode == "decoupled_kv" and (mllm_embeddings is not None):
+            k_mllm = self.norm_k_mllm(self.k_mllm(mllm_embeddings))
+            v_mllm = self.v_mllm(mllm_embeddings)
+            y_mllm = flash_attention(q, k_mllm, v_mllm, num_heads=self.num_heads)
+            x = x + y_mllm
             
         x = self.o(x)
         if q_mask is not None:
@@ -356,18 +366,17 @@ class DiTBlock(nn.Module):
         num_heads: int,
         ffn_dim: int,
         eps: float = 1e-6,
-        has_mllm_input: Union[bool, str] = False,
+        mllm_mode: Optional[str] = None,
     ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
-        self.mllm_mode = _normalize_mllm_mode(has_mllm_input)
-        self.has_mllm_input = self.mllm_mode is not None
+        self.mllm_mode = _normalize_mllm_mode(mllm_mode)
 
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(
-            dim, num_heads, eps, has_image_input=has_image_input, has_mllm_input=has_mllm_input)
+            dim, num_heads, eps, has_image_input=has_image_input, mllm_mode=self.mllm_mode)
         if self.mllm_mode == "mllm_cross":
             self.cross_attn2 = MLLMCrossAttention(dim, num_heads, eps)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -410,7 +419,7 @@ class DiTBlock(nn.Module):
         # x = x + self.cross_attn + self.cross_attn2 (cross_attn2 initialized to zero)
         norm_x = self.norm3(x)
         mllm_for_cross = None
-        if self.mllm_mode == "concat_kv" and (mllm_embeddings is not None) and (not mllm_zero_out):
+        if self.mllm_mode is not None and "kv" in self.mllm_mode and (mllm_embeddings is not None) and (not mllm_zero_out):
             mllm_for_cross = mllm_embeddings
         x = x + self.cross_attn(norm_x, context, mllm_embeddings=mllm_for_cross, q_mask=cross_attn_q_mask)
         if self.mllm_mode == "mllm_cross" and (mllm_embeddings is not None):
@@ -494,7 +503,14 @@ class Qwen3VLMllmEmbedding(nn.Module):
             self.rotary_emb = None
             self.config = None
         
-        self.proj = MLP(2560 if has_transformer_blocks else 2560, out_dim)
+        # self.proj = MLP(2560 if has_transformer_blocks else 2560, out_dim)
+
+        self.proj = nn.Sequential(
+            nn.Linear(2560, out_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(out_dim, out_dim),
+            RMSNorm(out_dim, eps=1e-5)
+        )
 
     def forward(
         self,
@@ -615,7 +631,7 @@ class WanModel(torch.nn.Module):
         require_clip_embedding: bool = True,
         fuse_vae_embedding_in_latents: bool = False,
         has_mllm_input: Union[bool, str] = False,
-        mllm_embed_num_layers: int = 4,
+        mllm_embed_num_layers: int = int(os.getenv("MLLM_TRANSFORMER_LAYER", "4")),
     ):
         super().__init__()
         self.dim = dim
@@ -638,7 +654,7 @@ class WanModel(torch.nn.Module):
         )
         self.mllm_mode = _normalize_mllm_mode(has_mllm_input)
         self.has_mllm_input = self.mllm_mode is not None
-        if self.has_mllm_input:
+        if self.mllm_mode is not None:
             # Adapt MLLM hidden states via lightweight Qwen3VL text layers, then map to model dim.
             self.mllm_embedding = Qwen3VLMllmEmbedding(dim, num_layers=mllm_embed_num_layers)
         self.time_embedding = nn.Sequential(
@@ -648,10 +664,12 @@ class WanModel(torch.nn.Module):
         )
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
-        self.blocks = nn.ModuleList([
-            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps, has_mllm_input=has_mllm_input)
-            for _ in range(num_layers)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps, mllm_mode=self.mllm_mode)
+                for _ in range(num_layers)
+            ]
+        )
         self.head = Head(dim, out_dim, patch_size, eps)
         head_dim = dim // num_heads
         self.freqs = precompute_freqs_cis_3d(head_dim)
@@ -711,7 +729,7 @@ class WanModel(torch.nn.Module):
         
         mllm_embeddings = None
         # Process MLLM hidden states to MLLM embeddings (outer layer responsibility)
-        if self.has_mllm_input and mllm_hidden_states is not None:
+        if self.mllm_mode is not None and mllm_hidden_states is not None:
             # Expect mllm_hidden_states shape (B, L, Hdim)
             mllm_embeddings = self.mllm_embedding(
                 mllm_hidden_states,
@@ -816,13 +834,13 @@ class WanModel(torch.nn.Module):
         from safetensors import safe_open
         
         if self.init_load == 0:
-            if path and not any("mllm_embedding" in k for k in state_dict.keys()):
-                mllm_connector = {}
+            if path:
+                params = {}
                 with safe_open(path, framework="pt", device="cpu") as f:
                     for k in f.keys():
                         if "lora" not in k:
-                            mllm_connector[k] = f.get_tensor(k)
-                state_dict.update(mllm_connector)
+                            params[k] = f.get_tensor(k)
+                state_dict.update(params)
             
             # Check if cross_attn2 is missing and cross_attn exists
             has_cross_attn2 = any("cross_attn2" in k for k in state_dict.keys())
@@ -839,6 +857,23 @@ class WanModel(torch.nn.Module):
                             # Exclude image-related keys
                             if not any(sub in key for sub in ["_img"]):
                                 new_keys[cross_attn2_key] = value.clone()
+                state_dict.update(new_keys)
+                
+            has_cross_concat = any("k_mllm" in k for k in state_dict.keys())
+            
+            if not has_cross_concat and "kv" in self.mllm_mode:
+                new_keys = {}
+                for key, value in state_dict.items():
+                    # Match T5 cross_attn weights: .cross_attn.k, .cross_attn.v, .cross_attn.norm_k, .cross_attn.norm_q
+                    if ".cross_attn.k" in key:
+                        mllm_key = key.replace(".cross_attn.k", ".cross_attn.k_mllm")
+                        new_keys[mllm_key] = value.clone()
+                    elif ".cross_attn.v" in key:
+                        mllm_key = key.replace(".cross_attn.v", ".cross_attn.v_mllm")
+                        new_keys[mllm_key] = value.clone()
+                    elif ".cross_attn.norm_k" in key:
+                        mllm_key = key.replace(".cross_attn.norm_k", ".cross_attn.norm_k_mllm")
+                        new_keys[mllm_key] = value.clone()
                 state_dict.update(new_keys)
 
             self.init_load += 1

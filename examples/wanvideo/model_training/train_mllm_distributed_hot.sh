@@ -25,7 +25,7 @@ export WANDB_API_KEY="c034c199c0ac6fe718bd148a2fc8c84602cba136"
 export WANDB_MODE="offline"
 # export DISABLE_MLLM=1
 export MLLM_INIT=1
-export MLLM_TRANSFORMER=0
+# export MLLM_TRANSFORMER=0
 
 # Stage 2: Train DiT with LoRA using cached embeddings
 accelerate launch \
@@ -42,6 +42,7 @@ accelerate launch \
   --height 480 \
   --width 640 \
   --num_frames 241 \
+  --target_fps 6 \
   --model_path '[
     [
       "/root/workspace/zzt/models/Qwen/Qwen3-VL-4B-Instruct/model-00001-of-00002.safetensors",
@@ -56,17 +57,16 @@ accelerate launch \
   --learning_rate 2e-5 \
   --gradient_accumulation_steps 4 \
   --remove_prefix_in_ckpt "pipe." \
-  --output_path "./models/train2/Wan2.1-T2V-1.3B_lora_agibot-alpha_mllm_hot" \
+  --output_path "./models/train2/Wan2.1-T2V-1.3B_lora_agibot-alpha_mllm_hot_2" \
   --task "sft" \
-  --trainable_models "mllm_encoder" \
-  --lora_base_model "dit" \
-  --lora_target_modules "self_attn.q,self_attn.k,self_attn.v,self_attn.o,cross_attn.q,cross_attn.k,cross_attn.v,cross_attn.o,ffn.0,ffn.2" \
+  --lora_base_model "dit;mllm_encoder" \
+  --lora_target_modules "self_attn.q,self_attn.k,self_attn.v,self_attn.o,cross_attn.q,cross_attn.k,cross_attn.v,cross_attn.o,ffn.0,ffn.2;q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj" \
   --lora_rank 128 \
   --num_epochs 100 \
   --use_wandb \
   --wandb_project "SSD" \
-  --wandb_run_name "wan2.1-1.3b-t2v_agibot-alpha_mllm_hot" \
+  --wandb_run_name "wan2.1-1.3b-t2v_agibot-alpha_mllm_hot_2" \
   --save_steps 800 \
   --t5_cfg_drop 0.1 \
   --use_mllm_condition \
-  --resume_from_checkpoint /root/workspace/zzt/Diff5/models/train2/Wan2.1-T2V-1.3B_lora_agibot-alpha_mllm_hot/checkpoint-1600
+  --resume_from_checkpoint "/root/workspace/zzt/Diff5/models/train2/Wan2.1-T2V-1.3B_lora_agibot-alpha_mllm_hot_2/checkpoint-2400"

@@ -161,23 +161,24 @@ class DiffusionTrainingModule(torch.nn.Module):
         
         # Add LoRA to the base models
         if lora_base_model is not None and not task.endswith(":data_process"):
-            if (not hasattr(pipe, lora_base_model)) or getattr(pipe, lora_base_model) is None:
-                print(f"No {lora_base_model} models in the pipeline. We cannot patch LoRA on the model. If this occurs during the data processing stage, it is normal.")
-                return
-            model = self.add_lora_to_model(
-                getattr(pipe, lora_base_model),
-                target_modules=lora_target_modules.split(","),
-                lora_rank=lora_rank,
-                upcast_dtype=pipe.torch_dtype,
-            )
-            if lora_checkpoint is not None:
-                state_dict = load_state_dict(lora_checkpoint)
-                state_dict = self.mapping_lora_state_dict(state_dict)
-                load_result = model.load_state_dict(state_dict, strict=False)
-                print(f"LoRA checkpoint loaded: {lora_checkpoint}, total {len(state_dict)} keys")
-                if len(load_result[1]) > 0:
-                    print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
-            setattr(pipe, lora_base_model, model)
+            for lora_model, lora_target_module in zip(lora_base_model.split(';'), lora_target_modules.split(";")):
+                if (not hasattr(pipe, lora_model)) or getattr(pipe, lora_model) is None:
+                    print(f"No {lora_model} models in the pipeline. We cannot patch LoRA on the model. If this occurs during the data processing stage, it is normal.")
+                    return
+                model = self.add_lora_to_model(
+                    getattr(pipe, lora_model),
+                    target_modules=lora_target_module.split(","),
+                    lora_rank=lora_rank,
+                    upcast_dtype=pipe.torch_dtype,
+                )
+                if lora_checkpoint is not None:
+                    state_dict = load_state_dict(lora_checkpoint)
+                    state_dict = self.mapping_lora_state_dict(state_dict)
+                    load_result = model.load_state_dict(state_dict, strict=False)
+                    print(f"LoRA checkpoint loaded: {lora_checkpoint}, total {len(state_dict)} keys")
+                    if len(load_result[1]) > 0:
+                        print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
+                setattr(pipe, lora_model, model)
 
 
     def split_pipeline_units(self, task, pipe, trainable_models=None, lora_base_model=None):

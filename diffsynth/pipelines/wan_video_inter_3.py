@@ -22,7 +22,7 @@ except ImportError:
     create_block_mask = None
 
 BLOCK_DURATION = 5
-CLEAN_FRAME_COUNT = 2
+CLEAN_FRAME_COUNT = int(os.getenv("CLEAN_FRAME_COUNT", "2"))
 
 
 class WanVideoInterPipeline(BasePipeline):
@@ -826,12 +826,12 @@ class WanVideoUnit_MLLMEmbedder_MetaQuery(PipelineUnit):
             onload_model_names=("mllm_encoder",)
         )
         self.system_prompt = (
-            "Analyze the user's full video instruction and the provided partial video sequence. "
-            "First, concisely describe the key elements, actions, and scene of the existing video segment. "
-            "Then, predict the precise visual content for the next segment of video. "
-            "The prediction must strictly follow the user's full instruction while ensuring seamless temporal "
-            "continuity in motion, camera work, lighting, and object interactions with the existing frames. "
-            "For the initial frame (when no video exists), use the instruction as the sole basis to generate the starting scene."
+            "You are a helpful assistant. Given either a text–video interleaved sequence or only text, describe the next video period by detailing the following aspects: "
+            "1. The main content and theme of the next period, and how it continues the overall narrative from the full earlier sequence. "
+            "2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects, keeping long-range consistency with all earlier periods. Keep the same identities and names for recurring entities. Preserve stable attributes such as clothing, colors, unique marks, object designs, and scene layout unless the input explicitly indicates a change. Avoid introducing new main characters or objects unless the input requests them. "
+            "3. Actions, events, behaviors, temporal relationships, and physical movement changes of the objects. Describe events in clear time order within the next period and ensure causal continuity with the whole sequence: continue unfinished actions, respect prior goals and interactions, and keep motion and physics plausible. "
+            "4. Background environment, light, style, and atmosphere. Keep the setting and visual style consistent with the full history, including location, time-of-day, weather, and overall rendering style. Only change these if the input indicates a transition. "
+            "5. Camera angles, movements, and transitions used in the video. Keep cinematography consistent with the full history. If there is a transition from the previous period, describe it clearly and keep it coherent with earlier editing patterns. "
         )
     
     def process_video_for_mllm(self, pipe: WanVideoInterPipeline, input_video, block_info):
@@ -970,7 +970,7 @@ def compute_noise_pred_per_block_metaquery(
     # Apply mllm_cfg_drop per block (use torch.rand for distributed sync)
     mllm_zero_out = False
     if mllm_cfg_drop > 0 and torch.rand(1).item() < mllm_cfg_drop:
-        mllm_zero_out= True
+        mllm_embeddings = torch.zeros_like(mllm_embeddings)
     
     x_block = x_full[:, :, latent_start:latent_end, :, :]
     x_patched = dit.patchify(x_block)
