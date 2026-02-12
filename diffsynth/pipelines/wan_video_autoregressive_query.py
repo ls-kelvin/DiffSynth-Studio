@@ -226,6 +226,7 @@ class WanVideoAutoregressiveQueryPipeline(WanVideoInterPipeline_MetaQuery):
         tokens_per_latent_frame: int,
         use_gradient_checkpointing: bool,
         cfg_scale: float,
+        mllm_cfg_scale: float = 1.0,
         clean_latents_source: Optional[torch.Tensor] = None,
         progress_bar_cmd=tqdm,
     ) -> torch.Tensor:
@@ -270,27 +271,56 @@ class WanVideoAutoregressiveQueryPipeline(WanVideoInterPipeline_MetaQuery):
                 timestep_value=timestep,
             )
 
-            if cfg_scale != 1.0:
-                noise_pred_nega = compute_noise_pred_per_block_metaquery(
-                    dit=dit,
-                    block_idx=block["global_block_idx"],
-                    block_info=block,
-                    x_full=full_latents,
-                    input_latents=None,
-                    clean_input_latents=clean_source,
-                    freqs_full=freqs_full,
-                    context_per_block={block["global_block_idx"]: context_nega},
-                    t=t,
-                    t_mod=t_mod,
-                    t_clean=t_clean,
-                    t_mod_clean=t_mod_clean,
-                    mllm_embeddings=mllm_embeddings,
-                    tokens_per_latent_frame=tokens_per_latent_frame,
-                    use_gradient_checkpointing=use_gradient_checkpointing,
-                    device=self.device,
-                    timestep_value=timestep,
-                )
-                noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+            w_t = cfg_scale - 1.0
+            w_m = mllm_cfg_scale - 1.0
+
+            if w_t != 0.0 or w_m != 0.0:
+                noise_pred_nega = noise_pred_posi
+                if w_t != 0.0:
+                    noise_pred_nega = compute_noise_pred_per_block_metaquery(
+                        dit=dit,
+                        block_idx=block["global_block_idx"],
+                        block_info=block,
+                        x_full=full_latents,
+                        input_latents=None,
+                        clean_input_latents=clean_source,
+                        freqs_full=freqs_full,
+                        context_per_block={block["global_block_idx"]: context_nega},
+                        t=t,
+                        t_mod=t_mod,
+                        t_clean=t_clean,
+                        t_mod_clean=t_mod_clean,
+                        mllm_embeddings=mllm_embeddings,
+                        tokens_per_latent_frame=tokens_per_latent_frame,
+                        use_gradient_checkpointing=use_gradient_checkpointing,
+                        device=self.device,
+                        timestep_value=timestep,
+                    )
+
+                noise_pred_text_only = noise_pred_posi
+                if w_m != 0.0:
+                    noise_pred_text_only = compute_noise_pred_per_block_metaquery(
+                        dit=dit,
+                        block_idx=block["global_block_idx"],
+                        block_info=block,
+                        x_full=full_latents,
+                        input_latents=None,
+                        clean_input_latents=clean_source,
+                        freqs_full=freqs_full,
+                        context_per_block={block["global_block_idx"]: context_posi},
+                        t=t,
+                        t_mod=t_mod,
+                        t_clean=t_clean,
+                        t_mod_clean=t_mod_clean,
+                        mllm_embeddings=mllm_embeddings,
+                        tokens_per_latent_frame=tokens_per_latent_frame,
+                        use_gradient_checkpointing=use_gradient_checkpointing,
+                        device=self.device,
+                        timestep_value=timestep,
+                        mllm_cfg_drop=1.0,
+                    )
+
+                noise_pred = (1.0 + w_t + w_m) * noise_pred_posi - w_t * noise_pred_nega - w_m * noise_pred_text_only
             else:
                 noise_pred = noise_pred_posi
 
@@ -320,6 +350,7 @@ class WanVideoAutoregressiveQueryPipeline(WanVideoInterPipeline_MetaQuery):
         use_gt_vae: bool = False,
         gt_decode: bool = True,
         cfg_scale: Optional[float] = 5.0,
+        mllm_cfg_scale: Optional[float] = 1.0,
         num_inference_steps: Optional[int] = 50,
         sigma_shift: Optional[float] = 5.0,
         tiled: Optional[bool] = True,
@@ -442,6 +473,7 @@ class WanVideoAutoregressiveQueryPipeline(WanVideoInterPipeline_MetaQuery):
                 tokens_per_latent_frame=tokens_per_latent_frame,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 cfg_scale=cfg_scale,
+                mllm_cfg_scale=mllm_cfg_scale,
                 clean_latents_source=input_video_latents,
                 progress_bar_cmd=progress_bar_cmd,
             )

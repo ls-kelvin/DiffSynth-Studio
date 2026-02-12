@@ -127,6 +127,12 @@ def _to_timestep_stat_key(timestep: Optional[torch.Tensor]) -> Optional[Union[in
     return round(value, 6)
 
 
+def _mean_token_l2_over_d(x: torch.Tensor) -> float:
+    # x: (B, S, D) -> per-token L2 over D, then mean over B,S
+    x_f = x.detach().float()
+    return torch.linalg.vector_norm(x_f, dim=-1).mean().item()
+
+
 def sinusoidal_embedding_1d(dim, position):
     sinusoid = torch.outer(position.type(torch.float64), torch.pow(
         10000, -torch.arange(dim//2, dtype=torch.float64, device=position.device).div(dim//2)))
@@ -297,17 +303,17 @@ class CrossAttention(nn.Module):
             if norm_stats is not None and current_block_idx is not None:
                 timestep_key = _to_timestep_stat_key(current_timestep)
                 if timestep_key is not None:
-                    x_norm = torch.linalg.vector_norm(x.detach().float().flatten(start_dim=1), dim=1).mean().item()
-                    y_norm = torch.linalg.vector_norm(y_mllm.detach().float().flatten(start_dim=1), dim=1).mean().item()
+                    x_norm = _mean_token_l2_over_d(x)
+                    y_norm = _mean_token_l2_over_d(y_mllm)
                     stat_key = (int(current_block_idx), timestep_key)
                     if stat_key not in norm_stats:
                         norm_stats[stat_key] = {
-                            "x_l2_sum": 0.0,
-                            "y_mllm_l2_sum": 0.0,
+                            "x_token_l2_over_d_sum": 0.0,
+                            "y_mllm_token_l2_over_d_sum": 0.0,
                             "count": 0.0,
                         }
-                    norm_stats[stat_key]["x_l2_sum"] += float(x_norm)
-                    norm_stats[stat_key]["y_mllm_l2_sum"] += float(y_norm)
+                    norm_stats[stat_key]["x_token_l2_over_d_sum"] += float(x_norm)
+                    norm_stats[stat_key]["y_mllm_token_l2_over_d_sum"] += float(y_norm)
                     norm_stats[stat_key]["count"] += 1.0
             x = x + y_mllm
             
@@ -475,6 +481,21 @@ class DiTBlock(nn.Module):
             )
             if mllm_zero_out:
                 mllm_out = mllm_out * 0
+            if norm_stats is not None and current_block_idx is not None:
+                timestep_key = _to_timestep_stat_key(current_timestep)
+                if timestep_key is not None:
+                    x_norm = _mean_token_l2_over_d(x)
+                    y_norm = _mean_token_l2_over_d(mllm_out)
+                    stat_key = (int(current_block_idx), timestep_key)
+                    if stat_key not in norm_stats:
+                        norm_stats[stat_key] = {
+                            "x_token_l2_over_d_sum": 0.0,
+                            "y_mllm_token_l2_over_d_sum": 0.0,
+                            "count": 0.0,
+                        }
+                    norm_stats[stat_key]["x_token_l2_over_d_sum"] += float(x_norm)
+                    norm_stats[stat_key]["y_mllm_token_l2_over_d_sum"] += float(y_norm)
+                    norm_stats[stat_key]["count"] += 1.0
             x = x + mllm_out
 
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -745,8 +766,8 @@ class WanModel(torch.nn.Module):
                 {
                     "block_idx": int(block_idx),
                     "timestep": timestep,
-                    "x_l2_mean": float(payload.get("x_l2_sum", 0.0)) / count,
-                    "y_mllm_l2_mean": float(payload.get("y_mllm_l2_sum", 0.0)) / count,
+                    "x_token_l2_over_d_mean": float(payload.get("x_token_l2_over_d_sum", 0.0)) / count,
+                    "y_mllm_token_l2_over_d_mean": float(payload.get("y_mllm_token_l2_over_d_sum", 0.0)) / count,
                     "samples": int(payload.get("count", 0.0)),
                 }
             )
