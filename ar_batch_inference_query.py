@@ -199,7 +199,7 @@ def main():
                 use_gt_vae=args.use_gt_vae,
                 gt_decode=args.gt_decode,
                 cfg_scale=args.cfg_scale,
-                # mllm_cfg_scale=args.mllm_cfg_scale,
+                mllm_cfg_scale=args.mllm_cfg_scale,
                 num_inference_steps=args.num_inference_steps,
                 sigma_shift=args.sigma_shift,
                 tiled=args.tiled,

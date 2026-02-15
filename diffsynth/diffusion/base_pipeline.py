@@ -1,5 +1,6 @@
 from PIL import Image
 import torch
+import os
 import numpy as np
 from einops import repeat, reduce
 from typing import Union
@@ -262,6 +263,54 @@ class BasePipeline(torch.nn.Module):
             print(f"{updated_num} tensors are patched by LoRA. You can use `pipe.clear_lora()` to clear all LoRA layers.")
         else:
             lora_loader.fuse_lora_to_base_model(module, lora, alpha=alpha)
+            
+    def load_weights(self, lora_path):
+        """
+        加载LoRA权重到pipeline中。
+        
+        Args:
+            pipe: WanVideoAutoregressiveQueryPipeline实例
+            lora_path: LoRA权重文件的完整路径
+            device: 计算设备
+            rank: 当前进程rank，用于打印信息
+        
+        Returns:
+            bool: 是否成功加载
+        """
+        if lora_path is None or lora_path == "":
+            print("⚠️  LoRA path is empty, skipping LoRA loading.")
+            return False
+        
+        if not os.path.exists(lora_path):
+            print(f"⚠️  LoRA file not found: {lora_path}, skipping.")
+            return False
+        
+        try:
+            state_dict = load_state_dict(lora_path, torch_dtype=self.torch_dtype, device=self.device)
+            
+            # 分离DiT和MLLM的权重
+            dit_state_dict = {k.replace("dit.", ""): v for k, v in state_dict.items() if k.startswith("dit.")}
+            mllm_state_dict = {k.replace("mllm_encoder.", ""): v for k, v in state_dict.items() if k.startswith("mllm_encoder.")}
+            
+            # 如果没有找到dit.前缀的权重，尝试直接使用（兼容旧格式）
+            if len(dit_state_dict) == 0:
+                print("DiT is empty!")
+                dit_state_dict = {k: v for k, v in state_dict.items() if not k.startswith("mllm_encoder.")}
+            
+            # 加载到模型
+            unexpected_param = self.dit.load_state_dict(dit_state_dict, strict=False)
+            print(f"Unexcepted params for dit:{unexpected_param}")
+            unexpected_param = self.mllm_encoder.load_state_dict(mllm_state_dict, strict=False)
+            print(f"Unexcepted params for dit:{unexpected_param}")
+            self.load_lora(self.dit, state_dict=dit_state_dict, alpha=1.0)
+            
+            print(f"✅ LoRA loaded: {lora_path}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to load LoRA from {lora_path}: {e}")
+            return False
             
             
     def clear_lora(self):

@@ -105,6 +105,13 @@ class WanMLLMQueryTrainingModule(DiffusionTrainingModule):
             preset_lora_path, preset_lora_model,
             task=task,
         )
+        
+        # Init
+        if os.getenv("MLLM_INIT", None):
+            path = os.getenv("MLLM_INIT")
+            self.pipe.load_weights(path)
+            print(f"Init from {path}")
+            
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []

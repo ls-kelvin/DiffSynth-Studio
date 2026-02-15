@@ -66,7 +66,35 @@ def launch_training_task(
     generator = torch.Generator()
     generator.manual_seed(dataloader_seed)
     
-    optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+    def split_lora_params(named_params):
+        lora, base = [], []
+        for n, p in named_params:
+            if p is None or (not p.requires_grad):
+                continue
+            # 以名字包含 "lora" 为判定标准；如果你项目里命名不同，改这里即可
+            if "lora" in n.lower():
+                lora.append(p)
+            else:
+                base.append(p)
+        return base, lora
+
+
+    # 建议用 trainable_modules() 对应的参数集合；如果 trainable_modules() 不是 nn.Module，而是参数迭代器，
+    # 那就退回用 model.named_parameters() 来分组（见下方 fallback）
+    base_params, lora_params = split_lora_params(model.named_parameters())
+
+    param_groups = []
+    if base_params:
+        param_groups.append(
+            {"params": base_params, "lr": learning_rate, "weight_decay": weight_decay}
+        )
+    if lora_params:
+        param_groups.append(
+            {"params": lora_params, "lr": learning_rate * 5.0, "weight_decay": weight_decay}
+        )
+
+    optimizer = torch.optim.AdamW(param_groups)
+
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(
         dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers, generator=generator

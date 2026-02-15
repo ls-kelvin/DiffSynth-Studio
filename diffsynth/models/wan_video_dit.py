@@ -303,8 +303,10 @@ class CrossAttention(nn.Module):
             if norm_stats is not None and current_block_idx is not None:
                 timestep_key = _to_timestep_stat_key(current_timestep)
                 if timestep_key is not None:
-                    x_norm = _mean_token_l2_over_d(x)
-                    y_norm = _mean_token_l2_over_d(y_mllm)
+                    x_proj = self.o(x)
+                    y_mllm_proj = self.o(y_mllm)
+                    x_norm = _mean_token_l2_over_d(x_proj)
+                    y_norm = _mean_token_l2_over_d(y_mllm_proj)
                     stat_key = (int(current_block_idx), timestep_key)
                     if stat_key not in norm_stats:
                         norm_stats[stat_key] = {
@@ -553,7 +555,7 @@ class Qwen3VLMllmEmbedding(nn.Module):
                     "mrope_interleaved": True,
                     "mrope_section": [24, 20, 20],
                 },
-                attn_implementation="flex_attention" if USE_FLEX_ATTENTION else None,
+                attn_implementation="flash_attention_2",
             )
             self.layers = nn.ModuleList(
                 [Qwen3VLTextDecoderLayer(self.config, layer_idx) for layer_idx in range(num_layers)]
@@ -750,7 +752,7 @@ class WanModel(torch.nn.Module):
             self.control_adapter = None
 
         self.init_load = 0
-        self.cross_attn_norm_stats: Dict[Any, Dict[str, float]] = {}
+        self.cross_attn_norm_stats: Dict[Any, Dict[str, float]] = None
 
     def reset_cross_attn_norm_stats(self):
         self.cross_attn_norm_stats = {}
@@ -912,7 +914,7 @@ class WanModel(torch.nn.Module):
         x = self.unpatchify(x, (f, h, w))
         return x
 
-    def load_state_dict(self, state_dict, assign: bool = False, strict: bool = True, path="models/step-66000.safetensors" if os.getenv("MLLM_INIT") else None):
+    def load_state_dict(self, state_dict, assign: bool = False, strict: bool = True, path=os.getenv("MLLM_INIT", None)):
         """Custom load_state_dict to support partial loading for backward compatibility.
 
         When strict=False, missing keys in the provided state_dict are ignored,
@@ -923,13 +925,6 @@ class WanModel(torch.nn.Module):
         from safetensors import safe_open
         
         if self.init_load == 0:
-            if path:
-                params = {}
-                with safe_open(path, framework="pt", device="cpu") as f:
-                    for k in f.keys():
-                        if "lora" not in k:
-                            params[k] = f.get_tensor(k)
-                state_dict.update(params)
             
             # Check if cross_attn2 is missing and cross_attn exists
             has_cross_attn2 = any("cross_attn2" in k for k in state_dict.keys())

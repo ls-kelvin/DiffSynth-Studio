@@ -10,6 +10,7 @@ from typing import Optional, List, Union
 
 import torch
 from PIL import Image
+from PIL import ImageFilter
 from tqdm import tqdm
 
 from .wan_video_inter_3 import (
@@ -331,6 +332,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                 tokens_per_latent_frame=tokens_per_latent_frame,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 device=self.device,
+                timestep_value=timestep,
             )
 
             w_t = cfg_scale - 1.0
@@ -359,6 +361,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                         tokens_per_latent_frame=tokens_per_latent_frame,
                         use_gradient_checkpointing=use_gradient_checkpointing,
                         device=self.device,
+                        timestep_value=timestep,
                     )
 
                 noise_pred_text_only = noise_pred_posi
@@ -383,6 +386,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                         tokens_per_latent_frame=tokens_per_latent_frame,
                         use_gradient_checkpointing=use_gradient_checkpointing,
                         device=self.device,
+                        timestep_value=timestep,
                     )
 
                 noise_pred = (1.0 + w_t + w_m) * noise_pred_posi - w_t * noise_pred_nega - w_m * noise_pred_text_only
@@ -594,6 +598,12 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                         tile_stride=tile_stride,
                     )
                     all_video_frames = self.vae_output_to_video(all_video)
+
+                    # all_video_frames = [
+                    #     frame.filter(ImageFilter.GaussianBlur(radius=20))
+                    #     for frame in all_video_frames
+                    # ]
+
                     generated_video_frames = all_video_frames
                     print(f"  Decoded {len(all_video_frames)} frames up to block {block_idx}")
 

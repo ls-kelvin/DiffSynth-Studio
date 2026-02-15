@@ -316,6 +316,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                 tokens_per_latent_frame=tokens_per_latent_frame,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 device=self.device,
+                timestep_value=timestep,
             )
 
             w_t = cfg_scale - 1.0
@@ -344,6 +345,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                         tokens_per_latent_frame=tokens_per_latent_frame,
                         use_gradient_checkpointing=use_gradient_checkpointing,
                         device=self.device,
+                        timestep_value=timestep,
                     )
 
                 noise_pred_text_only = noise_pred_posi
@@ -368,6 +370,7 @@ class WanVideoAutoregressiveInterPipeline(WanVideoInterPipeline):
                         tokens_per_latent_frame=tokens_per_latent_frame,
                         use_gradient_checkpointing=use_gradient_checkpointing,
                         device=self.device,
+                        timestep_value=timestep,
                     )
 
                 noise_pred = (1.0 + w_t + w_m) * noise_pred_posi - w_t * noise_pred_nega - w_m * noise_pred_text_only
